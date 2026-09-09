@@ -1,3 +1,6 @@
 /yank
 .DS_Store
 *.log
+
+# Agent scratch, not project source
+.claude/agent-memory/
