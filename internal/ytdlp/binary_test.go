@@ -283,6 +283,28 @@ func TestClassifyProbeTreatsWaitDelayWithOutputAsSuccess(t *testing.T) {
 	}
 }
 
+func TestClassifyProbeCancellationOutranksWaitDelayWithOutput(t *testing.T) {
+	// Issue #11, the same shape classifyInfoRun was fixed for. os/exec can
+	// report ErrWaitDelay on a cancelled run: the context fires, Cancel finds
+	// the process already done and leaves err nil, and the WaitDelay timer then
+	// expires on the pipe a child still holds. The version really was printed,
+	// but the caller asked us to stop, and answering with a version says the
+	// cancellation never happened.
+	version, err := classifyProbe("/bin/yt-dlp", []byte("2026.08.19\n"), exec.ErrWaitDelay, context.Canceled, context.Canceled, time.Minute)
+	if err == nil {
+		t.Fatalf("classifyProbe() = %q, <nil>; want cancellation to outrank the ErrWaitDelay shortcut", version)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want it to wrap context.Canceled", err)
+	}
+	if isBadBinary(err) {
+		t.Errorf("isBadBinary(%v) = true, want false: a cancelled probe says nothing about the file", err)
+	}
+	if version != "" {
+		t.Errorf("version = %q, want no version alongside the error", version)
+	}
+}
+
 func TestClassifyProbeBadBinaryCases(t *testing.T) {
 	tests := []struct {
 		name   string

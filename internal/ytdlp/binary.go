@@ -252,16 +252,25 @@ func classifyProbe(path string, out []byte, runErr, callerCtxErr, probeCtxErr er
 		return version, nil
 	}
 
-	// ErrWaitDelay means the process exited successfully but something still
-	// held its output pipes; Go only reports it when no cancellation happened.
-	// Output already collected is therefore the real answer.
+	// Cancellation is checked before anything else. os/exec can report
+	// ErrWaitDelay on a cancelled run: when the context fires and Cancel finds
+	// the process already done, watchCtx keeps err nil, the WaitDelay timer
+	// then fires on the still-held stdout pipe, and Wait returns ErrWaitDelay
+	// with ctx.Err() == context.Canceled. Taking the shortcut below first would
+	// answer a caller who asked us to stop with a version, as though nothing
+	// had been cancelled.
+	if callerCtxErr != nil {
+		return "", &probeError{fmt.Errorf("%s --version: %w", path, callerCtxErr), false}
+	}
+
+	// ErrWaitDelay with nobody cancelling means the process exited successfully
+	// but something still held its output pipes. Output already collected is
+	// therefore the real answer.
 	if errors.Is(runErr, exec.ErrWaitDelay) && version != "" {
 		return version, nil
 	}
 
 	switch {
-	case callerCtxErr != nil:
-		return "", &probeError{fmt.Errorf("%s --version: %w", path, callerCtxErr), false}
 	case probeCtxErr != nil:
 		return "", &probeError{fmt.Errorf("%s --version timed out after %s", path, timeout), false}
 	case errors.Is(runErr, exec.ErrWaitDelay):
