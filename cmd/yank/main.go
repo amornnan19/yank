@@ -6,6 +6,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/amornnan19/yank/internal/ytdlp"
+
 	// bubbles and lipgloss are not used yet; the next slice builds the TUI
 	// on top of them. Blank-imported here so go.mod/go.sum already pin them.
 	_ "github.com/charmbracelet/bubbles"
@@ -26,19 +28,14 @@ func main() {
 }
 
 // setupDebugLog opens (creating as needed) <cache>/yank/yank.log for debug
-// logging via tea.LogToFile, where <cache> is $XDG_CACHE_HOME if set and
-// non-empty, otherwise ~/.cache.
+// logging via tea.LogToFile. The <cache>/yank root comes from ytdlp.CacheRoot
+// so that the log file and the cached yt-dlp binary cannot drift apart.
 func setupDebugLog() (*os.File, error) {
-	cacheDir := os.Getenv("XDG_CACHE_HOME")
-	if cacheDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, err
-		}
-		cacheDir = filepath.Join(home, ".cache")
+	logDir, err := ytdlp.CacheRoot()
+	if err != nil {
+		return nil, err
 	}
 
-	logDir := filepath.Join(cacheDir, "yank")
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return nil, err
 	}
