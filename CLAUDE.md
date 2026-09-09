@@ -50,6 +50,14 @@ re-execs and a descendant inherits the pipes — set `cmd.WaitDelay`, and then
 remember that `WaitDelay` returns `exec.ErrWaitDelay` on an otherwise
 successful exit.
 
+**Remote text is not safe to print.** Titles, uploaders and yt-dlp's own error
+messages come from a page we did not write. Strip control characters and escape
+sequences before measuring or rendering them. `lipgloss.Width` is a display-width
+helper, not a sanitiser: it reports the widest *line* of a multi-line string, so a
+title with a newline in it measures small, survives truncation intact, and takes
+an extra row on screen. Truncate before styling, never after — cutting a rendered
+string can drop its reset sequence and let the style bleed down the page.
+
 **Dependencies.** `bubbletea`, `bubbles`, `lipgloss`, and nothing else. The
 standard library covers the rest. `internal/ytdlp` imports no third-party
 package at all.
