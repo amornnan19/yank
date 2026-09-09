@@ -58,6 +58,14 @@ func (m *Model) layout() {
 	// The box costs two cells of border and two of padding, and textinput
 	// wants one more for the cursor sitting past the last character.
 	m.input.Width = max(4, cw-5)
+	// textinput works out which slice of a long value is visible when the value
+	// is set, so a width arriving afterwards — New filling the box from the
+	// command line, or a resize — leaves the old window in place until the next
+	// keystroke, and a width of zero counts the whole string as visible. That
+	// is a URL rendered past the border of its own box on the first frame.
+	// SetCursor recomputes the window and clamps to where the cursor already
+	// is, so nothing moves.
+	m.input.SetCursor(m.input.Position())
 	m.bar.Width = cw
 }
 

@@ -11,8 +11,11 @@ import (
 // ctx bounds the program: cancelling it cancels whatever yt-dlp run is in
 // flight and ends the loop. The alt screen is entered so the terminal the user
 // came from is untouched when yank exits.
-func Run(ctx context.Context, deps Deps) error {
-	return runProgram(tea.NewProgram(New(ctx, deps), tea.WithAltScreen(), tea.WithContext(ctx)))
+//
+// startURL is the URL yank was started with, or "" to start on the input
+// screen; see New for what a URL that does not validate does.
+func Run(ctx context.Context, deps Deps, startURL string) error {
+	return runProgram(tea.NewProgram(New(ctx, deps, startURL), tea.WithAltScreen(), tea.WithContext(ctx)))
 }
 
 // runProgram is the loop plus the cleanup that has to happen whichever way it

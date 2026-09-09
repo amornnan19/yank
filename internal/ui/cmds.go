@@ -62,6 +62,18 @@ type firstRunNoticeMsg struct {
 	seq int
 }
 
+// startURLMsg carries no data: it is the command line's URL being submitted,
+// once, from Init. The URL itself is already in the input box, so the handler
+// reads it from there and every check the enter key performs is performed here
+// too.
+type startURLMsg struct{}
+
+// startURLCmd delivers startURLMsg. It carries no seq because it starts an
+// attempt rather than reporting on one.
+func startURLCmd() tea.Cmd {
+	return func() tea.Msg { return startURLMsg{} }
+}
+
 // quitTimeoutMsg fires when a quit has waited long enough for the runs it
 // cancelled to report back.
 type quitTimeoutMsg struct{}

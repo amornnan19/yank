@@ -169,10 +169,11 @@ func cancelledErr() error { return fmt.Errorf("downloading: %w", context.Cancele
 // --- driving the model ------------------------------------------------------
 
 // testModel is a model with a known terminal size, so View assertions do not
-// depend on the default.
+// depend on the default. It starts on the input screen; startModel is the one
+// that starts from a command-line URL.
 func testModel(t *testing.T, f *fakes, width int) Model {
 	t.Helper()
-	m := New(context.Background(), f.deps())
+	m := New(context.Background(), f.deps(), "")
 	m.width, m.height = width, 24
 	m.layout()
 	return m

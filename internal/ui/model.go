@@ -73,6 +73,12 @@ type Model struct {
 	step     probeStep
 	firstRun bool
 
+	// startURL is a URL that came from the command line. It is submitted once,
+	// from Init, and then never read again: reset builds its fresh model with
+	// an empty one, so done → enter goes back to the input screen rather than
+	// downloading the same thing a second time.
+	startURL string
+
 	// probe is the extraction the picker and the download are working from.
 	// While it is non-nil the model owes it exactly one Cleanup.
 	probe  *ytdlp.ProbeResult
@@ -99,7 +105,13 @@ type Model struct {
 
 // New builds the model. ctx bounds the whole program: cancelling it cancels
 // whatever attempt is in flight.
-func New(ctx context.Context, deps Deps) Model {
+//
+// startURL is the URL yank was started with, or "" to start on the input
+// screen. It is put in the box rather than kept beside it, and submitted from
+// Init through the same path the enter key takes, so a URL that is not one
+// lands where a typed one would: on the input screen, with the hint under the
+// box and the text still there to be fixed.
+func New(ctx context.Context, deps Deps, startURL string) Model {
 	in := textinput.New()
 	in.Placeholder = "https://www.youtube.com/watch?v=…"
 	in.Prompt = ""
@@ -113,22 +125,35 @@ func New(ctx context.Context, deps Deps) Model {
 	bar.EmptyColor = ""
 
 	m := Model{
-		deps:  deps,
-		ctx:   ctx,
-		state: stateInput,
-		width: defaultWidth,
-		input: in,
-		spin:  spinner.New(spinner.WithSpinner(spinner.MiniDot)),
-		bar:   bar,
+		deps:     deps,
+		ctx:      ctx,
+		state:    stateInput,
+		width:    defaultWidth,
+		input:    in,
+		spin:     spinner.New(spinner.WithSpinner(spinner.MiniDot)),
+		bar:      bar,
+		startURL: startURL,
+	}
+	if startURL != "" {
+		m.input.SetValue(startURL)
 	}
 	m.layout()
 	return m
 }
 
-// Init starts the cursor blinking. Nothing is resolved or fetched until the
-// user submits a URL: the first run's download is worth showing a status line
-// for, and there is no status line before there is a screen.
-func (m Model) Init() tea.Cmd { return textinput.Blink }
+// Init starts the cursor blinking. Nothing is resolved or fetched until a URL
+// is submitted: the first run's download is worth showing a status line for,
+// and there is no status line before there is a screen.
+//
+// A URL from the command line is submitted here, as a message rather than as
+// work done in New, so that the transition happens in Update where every other
+// one does — with the same seq and pending accounting behind it.
+func (m Model) Init() tea.Cmd {
+	if m.startURL == "" {
+		return textinput.Blink
+	}
+	return tea.Batch(textinput.Blink, startURLCmd())
+}
 
 // Update is the whole state machine.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -164,6 +189,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.spin, cmd = m.spin.Update(msg)
 		return m, cmd
+
+	case startURLMsg:
+		// The URL yank was started with, arriving as though it had been typed
+		// and submitted. Ignored anywhere but the input screen: by the time it
+		// lands the user may already have gone somewhere else.
+		if m.state != stateInput {
+			return m, nil
+		}
+		return m.submit()
 
 	case firstRunNoticeMsg:
 		if msg.seq == m.seq && m.state == stateProbing && m.step == stepResolving {
@@ -380,7 +414,9 @@ func (m Model) reset() Model {
 	m.abandon()
 	m.releaseProbe()
 
-	fresh := New(m.ctx, m.deps)
+	// The fresh model gets no start URL: enter on the done screen means
+	// "another one", not "that one again".
+	fresh := New(m.ctx, m.deps, "")
 	fresh.width, fresh.height = m.width, m.height
 	fresh.bin, fresh.hasBin = m.bin, m.hasBin
 	fresh.seq = m.seq + 1

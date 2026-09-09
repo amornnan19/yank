@@ -1086,7 +1086,7 @@ func TestCtrlCQuitsFromAnywhereAndCleansUp(t *testing.T) {
 func TestCancellingTheProgramContextCancelsTheAttempt(t *testing.T) {
 	f := &fakes{}
 	ctx, cancel := context.WithCancel(context.Background())
-	m := New(ctx, f.deps())
+	m := New(ctx, f.deps(), "")
 	m.hasBin = true
 	m = typeURL(m, "https://example.com/v")
 	m = send(m, keyOf(tea.KeyEnter))
@@ -1126,5 +1126,247 @@ func TestUpdateDoesNotRunYtdlpInline(t *testing.T) {
 	}
 	if _, ok := findMsg[downloadDoneMsg](collect(t, cmd)); !ok {
 		t.Fatal("the command did not run Download")
+	}
+}
+
+// --- a URL from the command line --------------------------------------------
+
+// startModel is New given a start URL, with Init run: the returned messages are
+// what the program would have delivered on its first tick.
+func startModel(t *testing.T, f *fakes, startURL string) (Model, []tea.Msg) {
+	t.Helper()
+	m := New(context.Background(), f.deps(), startURL)
+	m.width, m.height = 80, 24
+	m.hasBin = true
+	m.bin = ytdlp.Result{Path: "/tmp/yt-dlp", HasFFmpeg: true}
+	m.layout()
+	return m, collect(t, m.Init())
+}
+
+func TestNoStartURLStartsOnTheInputScreen(t *testing.T) {
+	f := &fakes{}
+	m, msgs := startModel(t, f, "")
+
+	if _, ok := findMsg[startURLMsg](msgs); ok {
+		t.Fatal("an empty start URL was submitted anyway")
+	}
+	if m.state != stateInput {
+		t.Fatalf("state = %v, want stateInput", m.state)
+	}
+	if m.input.Value() != "" {
+		t.Fatalf("the box holds %q, want it empty", m.input.Value())
+	}
+	if probe, _, _ := f.counts(); probe != 0 {
+		t.Fatalf("Probe was called %d times before anything was submitted", probe)
+	}
+}
+
+func TestStartURLGoesStraightToProbing(t *testing.T) {
+	f := &fakes{
+		probes: []probeOutcome{{probe: newProbe(t, "A Video", "Someone")}},
+		rows:   []ytdlp.Row{{Key: "video-1080", Label: "1080p  mp4  ~10 MB"}},
+	}
+	const url = "https://example.com/v"
+	m, msgs := startModel(t, f, url)
+
+	start, ok := findMsg[startURLMsg](msgs)
+	if !ok {
+		t.Fatal("a start URL produced nothing to submit: Init did not carry it")
+	}
+	if m.state != stateInput {
+		t.Fatalf("state = %v before the message was handled, want stateInput", m.state)
+	}
+
+	m, cmd := step(m, start)
+	if m.state != stateProbing {
+		t.Fatalf("state = %v, want stateProbing", m.state)
+	}
+	if m.url != url {
+		t.Fatalf("probing %q, want %q", m.url, url)
+	}
+
+	m, _ = advance(t, m, cmd)
+	if m.state != statePicker {
+		t.Fatalf("state = %v, want statePicker", m.state)
+	}
+	if got := f.probeURLs; len(got) != 1 || got[0] != url {
+		t.Fatalf("probed %v, want the start URL exactly once", got)
+	}
+	// The URL is in the box, as it would be had the user typed it, so esc back
+	// to the input screen leaves something to edit.
+	if m.input.Value() != url {
+		t.Fatalf("the box holds %q, want the start URL", m.input.Value())
+	}
+}
+
+// A URL from the command line goes through normaliseURL, not around it: the
+// bare host and the scheme-less form work, exactly as typing them does.
+func TestStartURLIsNormalisedTheSameWayATypedOneIs(t *testing.T) {
+	f := &fakes{probes: []probeOutcome{{probe: newProbe(t, "A Video", "Someone")}}}
+	m, msgs := startModel(t, f, "example.com/watch?v=x")
+
+	start, ok := findMsg[startURLMsg](msgs)
+	if !ok {
+		t.Fatal("a start URL produced nothing to submit")
+	}
+	m, _ = step(m, start)
+
+	if m.state != stateProbing {
+		t.Fatalf("state = %v, want stateProbing", m.state)
+	}
+	if m.url != "https://example.com/watch?v=x" {
+		t.Fatalf("probing %q, want the scheme filled in", m.url)
+	}
+}
+
+func TestStartURLThatIsNotAURLLandsOnTheInputScreen(t *testing.T) {
+	f := &fakes{}
+	// The shape this actually arrives in: a long path the shell completed,
+	// handed to yank by mistake. Long enough to have to fit in the box.
+	const typed = "/Users/someone/Movies/exports/2026-09/final renders/the whole thing v3 final.mp4"
+	m, msgs := startModel(t, f, typed)
+
+	start, ok := findMsg[startURLMsg](msgs)
+	if !ok {
+		t.Fatal("a start URL produced nothing to submit")
+	}
+	m, cmd := step(m, start)
+
+	if m.state != stateInput {
+		t.Fatalf("state = %v, want stateInput: a bad URL is not an error screen", m.state)
+	}
+	if m.hint == "" {
+		t.Fatal("no hint under the box: the URL was rejected silently")
+	}
+	if m.input.Value() != typed {
+		t.Fatalf("the box holds %q, want %q left there to be fixed", m.input.Value(), typed)
+	}
+	if probe, _, _ := f.counts(); probe != 0 {
+		t.Fatalf("Probe was called %d times for a URL that is not one", probe)
+	}
+	if cmd != nil {
+		t.Fatal("a rejected start URL still started work")
+	}
+	if !strings.Contains(m.View(), m.hint) {
+		t.Fatalf("the hint is not on screen:\n%s", m.View())
+	}
+	// A path that is not a URL is exactly the sort of long string that lands
+	// here, and it has to stay inside its box.
+	if rows := inputBoxRows(t, m.View()); rows != 1 {
+		t.Fatalf("the URL box is %d rows, want 1:\n%s", rows, m.View())
+	}
+}
+
+// done → enter means "another one", not "that one again": the start URL is not
+// resubmitted, and the box is empty and waiting.
+func TestDoneEnterDoesNotReprobeTheStartURL(t *testing.T) {
+	f := &fakes{
+		probes:    []probeOutcome{{probe: newProbe(t, "A Video", "Someone")}},
+		rows:      threeRows(),
+		downloads: []downloadOutcome{{res: &ytdlp.DownloadResult{Path: "/x/a.mp4"}}},
+	}
+	const url = "https://example.com/v"
+	m, msgs := startModel(t, f, url)
+
+	start, _ := findMsg[startURLMsg](msgs)
+	m, cmd := step(m, start)
+	m, _ = advance(t, m, cmd)
+	if m.state != statePicker {
+		t.Fatalf("state = %v, want statePicker", m.state)
+	}
+
+	m, cmd = step(m, keyOf(tea.KeyEnter))
+	done, ok := findMsg[downloadDoneMsg](collect(t, cmd))
+	if !ok {
+		t.Fatal("the picker did not run Download")
+	}
+	m = send(m, done)
+	if m.state != stateDone {
+		t.Fatalf("state = %v, want stateDone", m.state)
+	}
+
+	probesBefore, _, _ := f.counts()
+	m, cmd = step(m, keyOf(tea.KeyEnter))
+
+	if m.state != stateInput {
+		t.Fatalf("state = %v, want stateInput", m.state)
+	}
+	if m.startURL != "" {
+		t.Fatalf("the fresh model kept startURL %q", m.startURL)
+	}
+	if m.input.Value() != "" {
+		t.Fatalf("the box holds %q, want it empty and waiting", m.input.Value())
+	}
+	if _, ok := findMsg[startURLMsg](collect(t, cmd)); ok {
+		t.Fatal("enter on the done screen resubmitted the start URL")
+	}
+	if probe, _, _ := f.counts(); probe != probesBefore {
+		t.Fatalf("Probe ran %d more times after enter on the done screen", probe-probesBefore)
+	}
+	// And the reset released the info-json exactly once, as any other route
+	// out of the picker would.
+	if _, _, cleanups := f.counts(); cleanups != 1 {
+		t.Fatalf("Cleanup was called %d times, want exactly one for the one probe", cleanups)
+	}
+}
+
+// longStartURL is an ordinary YouTube link copied out of a playlist: long
+// enough not to fit the box at 80 columns, with nothing exotic in it.
+const longStartURL = "https://www.youtube.com/watch?v=jNQXAC9IVRw&list=PLtest&index=12&pp=paddingpaddingpadding"
+
+// inputBoxRows is how many lines the URL box takes between its borders. One is
+// the whole point: a value wider than the box wraps mid-token onto a second
+// line and the box grows a row.
+func inputBoxRows(t *testing.T, view string) int {
+	t.Helper()
+	top, bottom := -1, -1
+	for i, line := range strings.Split(view, "\n") {
+		switch {
+		case strings.Contains(line, "╭"):
+			top = i
+		case strings.Contains(line, "╰"):
+			bottom = i
+		}
+	}
+	if top < 0 || bottom < 0 {
+		t.Fatalf("no input box on screen:\n%s", view)
+	}
+	return bottom - top - 1
+}
+
+// The first frame is drawn before any message reaches the text input, so the
+// width has to be in place before the value is: textinput decides what is
+// visible when the value is set, and at a width of zero that is all of it.
+func TestALongStartURLFitsItsBoxOnTheFirstFrame(t *testing.T) {
+	f := &fakes{}
+	m := New(context.Background(), f.deps(), longStartURL)
+
+	view := m.View()
+	if rows := inputBoxRows(t, view); rows != 1 {
+		t.Fatalf("the URL box is %d rows on the first frame, want 1:\n%s", rows, view)
+	}
+	if w := widest(view); w > m.width {
+		t.Fatalf("the first frame is %d cells wide in a %d-column terminal:\n%s", w, m.width, view)
+	}
+	// Windowed, not truncated: the whole URL is still there to submit or edit.
+	if m.input.Value() != longStartURL {
+		t.Fatalf("the box holds %q, want the URL intact", m.input.Value())
+	}
+}
+
+// The same window has to be recomputed when the terminal turns out to be a
+// different size, which is the other frame nothing has typed into yet.
+func TestALongStartURLFitsItsBoxAfterAResize(t *testing.T) {
+	f := &fakes{}
+	m := New(context.Background(), f.deps(), longStartURL)
+
+	m = send(m, tea.WindowSizeMsg{Width: 40, Height: 24})
+
+	view := m.View()
+	if rows := inputBoxRows(t, view); rows != 1 {
+		t.Fatalf("the URL box is %d rows at 40 columns, want 1:\n%s", rows, view)
+	}
+	if w := widest(view); w > 40 {
+		t.Fatalf("the screen is %d cells wide in a 40-column terminal:\n%s", w, view)
 	}
 }
