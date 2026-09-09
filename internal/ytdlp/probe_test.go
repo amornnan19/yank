@@ -30,6 +30,7 @@ const infoFixture = `{
       "ext": "webm",
       "vcodec": "none",
       "acodec": "opus",
+      "protocol": "https",
       "abr": 134.464,
       "tbr": 134.464,
       "filesize": 3610916
@@ -39,6 +40,7 @@ const infoFixture = `{
       "ext": "mp4",
       "vcodec": "avc1.640028",
       "acodec": "none",
+      "protocol": "https",
       "height": 1080,
       "width": 1920,
       "fps": 25.0,
@@ -179,6 +181,11 @@ func TestProbeReturnsAPopulatedVideoInfo(t *testing.T) {
 	}
 	if got, want := res.Info.Formats[1].FilesizeApprox, int64(66658816); got != want {
 		t.Errorf("Formats[1].FilesizeApprox = %d, want %d", got, want)
+	}
+	// probe.go decodes straight into RawFormat, so a field added there arrives
+	// with no change to the decoder. Ranking reads this one.
+	if got, want := res.Info.Formats[1].Protocol, "https"; got != want {
+		t.Errorf("Formats[1].Protocol = %q, want %q", got, want)
 	}
 
 	// The document on disk must be the raw stdout, byte for byte: yt-dlp reads

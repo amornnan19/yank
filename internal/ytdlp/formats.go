@@ -53,14 +53,6 @@ const (
 	maxRows      = 7
 	maxVideoRows = 6
 
-	// sizelessBitrateEdge is how much higher a sizeless format's tbr must be
-	// before it outranks one that states its size, in betterQuality. Measured
-	// against a real YouTube list, where the HLS copy of a rendition reports
-	// 1.3x to 2.2x the tbr of its DASH twin: 3.0 leaves room above the widest
-	// gap observed for the same stream, and is still far below the multiple
-	// that separates genuinely different renditions.
-	sizelessBitrateEdge = 3.0
-
 	// maxRenderableFPS bounds what may go in a label. A frame rate past this is
 	// not a frame rate, and an out-of-range float64 does not convert to an int
 	// in any defined way.
@@ -97,6 +89,24 @@ const (
 	codecModern
 	// codecLegacy is avc1/h264 — the default winner.
 	codecLegacy
+)
+
+// protocolClass groups yt-dlp's protocol strings by what a format's tbr means,
+// which is what decides whether two of them may be compared.
+type protocolClass int
+
+const (
+	// protoUnknown is an empty or unrecognised protocol. It is no evidence
+	// either way, which is not the same as evidence of a direct stream.
+	protoUnknown protocolClass = iota
+	// protoDirect is a whole file or a stream fetched in ranges or segments —
+	// "https", "http", "http_dash_segments". Its tbr is the bitrate the stream
+	// was encoded at, and it usually states a filesize as well.
+	protoDirect
+	// protoHLS is "m3u8" or "m3u8_native", where tbr comes from the playlist's
+	// BANDWIDTH attribute: the peak a player must sustain, not the average the
+	// stream holds. It is normally sizeless.
+	protoHLS
 )
 
 // candidate is one eligible format plus the size its row would display.
@@ -305,57 +315,69 @@ func pickRepresentative(group []candidate) candidate {
 		}
 		return *other
 	}
-	// The threshold compares two sizes, so the two sizes have to be comparable.
-	// Both stated means two real filesizes; neither stated means two estimates
-	// off a bitrate, wrong in the same direction by roughly the same factor. One
-	// of each is a real number against a guess, and a 25% gap between those is
-	// as likely to be the provenance as the codec.
-	if modern != nil && legacy.known && modern.known && legacy.stated == modern.stated &&
+	// The threshold compares two sizes, so the two sizes have to be measuring
+	// the same thing. Provenance is readable now, so the guard names the one
+	// pair that is not comparable rather than refusing every stated-against-
+	// estimated pair: a size estimated off an m3u8 variant's peak bandwidth is
+	// inflated by whatever headroom the playlist advertises, and a 25% gap
+	// between that and anything else is as likely to be the headroom as the
+	// codec. A stated filesize against an estimate off a direct stream's own
+	// encoded bitrate is two measurements of the same quantity, one of them
+	// rounder than the other, and D3 may run on those.
+	if modern != nil && legacy.known && modern.known && peakEstimate(*legacy) == peakEstimate(*modern) &&
 		float64(modern.bytes) <= float64(legacy.bytes)*(1-modernCodecSizeAdvantage) {
 		return *modern
 	}
 	return *legacy
 }
 
+// peakEstimate reports that a candidate's displayed size was multiplied out of
+// an m3u8 variant's peak bandwidth, which overstates it by however much
+// headroom the playlist advertises. Such a number may be compared with another
+// of its kind and with nothing else.
+func peakEstimate(c candidate) bool {
+	return !c.stated && classifyProtocol(c.f.Protocol) == protoHLS
+}
+
 // betterQuality returns whichever of two same-class candidates should represent
 // the height.
 //
-// A format that states its own size beats one that does not — but only at a
-// comparable bitrate. YouTube lists each rendition twice, once as DASH with an
-// exact filesize and once as HLS with no filesize and a tbr that is peak
-// bandwidth rather than the average. Ranking on tbr alone hands the row to the
-// HLS copy and prints a size guessed off a bitrate that was never the file's,
-// which is exactly the decoration D1 exists to stop.
+// An m3u8 variant loses to a sibling served as a direct stream. Sites list the
+// same rendition twice, once as a file or a DASH stream that states an exact
+// filesize and once as an HLS variant that states none and reports a tbr taken
+// from the playlist's BANDWIDTH attribute — the peak a player must sustain, not
+// the bitrate the stream was encoded at. On the YouTube list that motivated
+// this, one 1080p avc1 stream is format 137 at 3038 kbit/s and format 270 at
+// 4688. Ranking on tbr alone hands the row to the m3u8 copy and prints a size
+// guessed off a bitrate that was never the file's, which is exactly the
+// decoration D1 exists to stop. Two entries this close in the list — same
+// height, same codec class — are that rendition listed twice far more often
+// than they are two different encodes, and the direct one is the one whose size
+// yank can state and whose bytes it can fetch without reassembling a playlist.
 //
-// The bitrate condition is what keeps that from overreaching. Preferring the
-// stated size is only right when the two entries are the same rendition listed
-// twice, and a bounded tbr gap is the evidence available for that without a
-// protocol field to read: on a real YouTube list the HLS copy's tbr runs 1.3x
-// to 2.2x its DASH twin's, never more. Past sizelessBitrateEdge the two are not
-// the same stream wearing two hats, they are different renditions — a 1.5 Mbps
-// progressive file next to a 6 Mbps variant — and the better stream wins even
-// though its size will have to be estimated.
+// The comparison needs positive evidence on both sides, so it fires only
+// between a known m3u8 entry and a known direct one. An absent or unrecognised
+// protocol is unknown, not "not HLS": read as direct it would let a missing
+// field outrank a real m3u8 sibling on no evidence at all, and read as HLS it
+// would demote every format from an extractor that omits the field, archive.org's
+// progressive files among them if it ever stopped sending one. Unknown
+// therefore falls through to the ordinary ranking, which is what it got before
+// there was a protocol to read.
 //
-// Only then does higher tbr win, then a known size over an unknown one, then
-// the smaller size, then the lower format id so the choice does not depend on
-// map or slice order.
+// Only then does higher tbr win — and between two entries of the same protocol
+// class a tbr comparison means something — then a known size over an unknown
+// one, then the smaller size, then the lower format id so the choice does not
+// depend on map or slice order.
 func betterQuality(best, c *candidate) *candidate {
 	if best == nil {
 		return c
 	}
+	cProto, bestProto := classifyProtocol(c.f.Protocol), classifyProtocol(best.f.Protocol)
 	switch {
-	case c.stated != best.stated:
-		stated, sizeless := c, best
-		if best.stated {
-			stated, sizeless = best, c
-		}
-		// A stated format with no bitrate at all gives nothing to compare
-		// against, and a real filesize is not worth trading for a guess on no
-		// evidence.
-		if stated.f.TBR > 0 && sizeless.f.TBR > stated.f.TBR*sizelessBitrateEdge {
-			return sizeless
-		}
-		return stated
+	case cProto == protoHLS && bestProto == protoDirect:
+		return best
+	case cProto == protoDirect && bestProto == protoHLS:
+		return c
 	case c.f.TBR != best.f.TBR:
 		if c.f.TBR > best.f.TBR {
 			return c
@@ -375,6 +397,22 @@ func betterQuality(best, c *candidate) *candidate {
 		return c
 	}
 	return best
+}
+
+// classifyProtocol maps yt-dlp's protocol string onto the classes ranking cares
+// about. Unlike a codec name, this string is yt-dlp's own — it comes from a
+// fixed set its extractors choose from, not from the site — so an exact match
+// is right here where codec names need case folding. "mhtml" is missing on
+// purpose: it is a storyboard, and newCandidate has already dropped it on
+// vcodec "none" before anything asks what protocol it uses.
+func classifyProtocol(protocol string) protocolClass {
+	switch protocol {
+	case "https", "http", "http_dash_segments":
+		return protoDirect
+	case "m3u8", "m3u8_native":
+		return protoHLS
+	}
+	return protoUnknown
 }
 
 // classifyCodec maps a vcodec string onto the three classes D3 cares about.

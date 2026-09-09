@@ -29,4 +29,9 @@ type RawFormat struct {
 	TBR            float64 `json:"tbr"`
 	Filesize       int64   `json:"filesize"`
 	FilesizeApprox int64   `json:"filesize_approx"`
+	// Protocol is yt-dlp's own name for how the stream is fetched — "https",
+	// "http_dash_segments", "m3u8_native" and the like. Ranking reads it to
+	// tell an m3u8 variant, whose tbr is the manifest's advertised peak, from a
+	// direct stream, whose tbr is the bitrate it was encoded at.
+	Protocol string `json:"protocol"`
 }

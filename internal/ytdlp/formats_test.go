@@ -38,21 +38,24 @@ func storyboard() RawFormat {
 	}
 }
 
-// hlsVariant builds the shape an HLS rendition arrives in: no filesize of any
-// kind, and a tbr that is peak bandwidth rather than the average, so its size
-// can only ever be estimated. YouTube lists one of these beside every DASH
-// format, and many other extractors emit them on their own.
+// hlsVariant builds the shape an HLS rendition arrives in: protocol
+// "m3u8_native", no filesize of any kind, and a tbr taken from the playlist's
+// BANDWIDTH attribute, which is a peak rather than the bitrate the stream holds,
+// so its size can only ever be estimated. YouTube lists one of these beside
+// every direct format, and many other extractors emit them on their own.
 func hlsVariant(id, vcodec string, height int, fps, tbr float64) RawFormat {
 	return RawFormat{
-		FormatID: id, Ext: "mp4", VCodec: vcodec, ACodec: "none",
+		FormatID: id, Ext: "mp4", Protocol: "m3u8_native", VCodec: vcodec, ACodec: "none",
 		Height: height, Width: height * 16 / 9, FPS: fps, TBR: tbr,
 	}
 }
 
-// videoOnly builds a DASH video stream: no audio, so its row is a merge.
+// videoOnly builds a video-only stream fetched directly, the way YouTube serves
+// its DASH renditions: no audio, so its row is a merge. A filesize of 0 leaves
+// it sizeless without changing how it is fetched.
 func videoOnly(id, ext, vcodec string, height int, fps, tbr float64, filesize int64) RawFormat {
 	return RawFormat{
-		FormatID: id, Ext: ext, VCodec: vcodec, ACodec: "none",
+		FormatID: id, Ext: ext, Protocol: "https", VCodec: vcodec, ACodec: "none",
 		Height: height, Width: height * 16 / 9, FPS: fps, TBR: tbr, Filesize: filesize,
 	}
 }
@@ -61,7 +64,7 @@ func videoOnly(id, ext, vcodec string, height int, fps, tbr float64, filesize in
 // ffmpeg and no merge.
 func progressive(id, ext, vcodec string, height int, fps, tbr float64, filesize int64) RawFormat {
 	return RawFormat{
-		FormatID: id, Ext: ext, VCodec: vcodec, ACodec: "mp4a.40.2",
+		FormatID: id, Ext: ext, Protocol: "https", VCodec: vcodec, ACodec: "mp4a.40.2",
 		Height: height, Width: height * 16 / 9, FPS: fps, ABR: 96, TBR: tbr, Filesize: filesize,
 	}
 }
@@ -367,12 +370,13 @@ func TestRank(t *testing.T) {
 	}
 }
 
-// TestSizelessRepresentative pins what happens when one candidate in a group
-// states its size and the other does not. Neither the bare "prefer the stated
-// one" rule nor the bare "prefer the higher tbr" rule is right on its own: the
-// first hands the row to a visibly worse rendition, the second hands it to an
-// estimate off a bitrate that was never the file's.
-func TestSizelessRepresentative(t *testing.T) {
+// TestProtocolPicksTheRepresentative pins what happens when a height group
+// holds an m3u8 variant beside a stream fetched directly. Neither "prefer the
+// one that states its size" nor "prefer the higher tbr" is right on its own:
+// the first hands the row to a visibly worse rendition, the second hands it to
+// an estimate off a bandwidth ceiling that was never the file's. The protocol
+// says which of the two a tbr comparison would be measuring.
+func TestProtocolPicksTheRepresentative(t *testing.T) {
 	tests := []struct {
 		name     string
 		duration *float64
@@ -380,33 +384,36 @@ func TestSizelessRepresentative(t *testing.T) {
 		want     gotRow
 	}{
 		{
-			name:     "the same rendition listed twice goes to the copy that states its size",
+			name:     "the same rendition listed twice goes to the direct copy",
 			duration: secs(213),
 			formats: []RawFormat{
-				// 96 is 137's HLS twin: 6% more tbr, and that tbr is a peak.
+				// 96 is 137's m3u8 twin: 6% more tbr, and that tbr is a peak.
 				hlsVariant("96", "avc1.640028", 1080, 25, 4688),
 				videoOnly("137", "mp4", "avc1.640028", 1080, 25, 4404, 116_700_000),
 			},
 			want: gotRow{"1080p  mp4  ~121 MB", "-f 137+ba/137/b[height<=1080]", "137"},
 		},
 		{
-			name:     "a genuinely better sizeless rendition still wins",
+			name:     "a far higher m3u8 tbr still does not take the row",
 			duration: secs(200),
 			formats: []RawFormat{
-				// 4x the bitrate is not peak-versus-average, it is a different
-				// stream, and 1.5 Mbps is not what 1080p should mean here.
-				videoOnly("mp4-low", "mp4", "avc1.640028", 1080, 25, 1500, 112_500_000),
+				// 3.75x is well past any peak-versus-average gap a real list
+				// shows, and it is still a number about a playlist rather than
+				// about a file. The direct stream is the one yank can size.
+				videoOnly("mp4-direct", "mp4", "avc1.640028", 1080, 25, 1600, 40_000_000),
 				hlsVariant("hls-hi", "avc1.640028", 1080, 25, 6000),
 			},
-			want: gotRow{"1080p  mp4  ~154 MB", "-f hls-hi+ba/hls-hi/b[height<=1080]", "hls-hi"},
+			want: gotRow{"1080p  mp4  ~44 MB", "-f mp4-direct+ba/mp4-direct/b[height<=1080]", "mp4-direct"},
 		},
 		{
-			name:     "a stated format with no bitrate at all is not traded away",
+			name:     "the direct copy wins with no bitrate to compare at all",
 			duration: secs(200),
 			formats: []RawFormat{
-				// Nothing to compare against, so the real filesize stands.
+				// The rule reads the protocol, so it needs no tbr on either
+				// side to reach an answer.
 				{
-					FormatID: "http-1080", Ext: "mp4", VCodec: "avc1.640028", ACodec: "none",
+					FormatID: "http-1080", Ext: "mp4", Protocol: "https",
+					VCodec: "avc1.640028", ACodec: "none",
 					Height: 1080, FPS: 25, Filesize: 112_500_000,
 				},
 				hlsVariant("hls-hi", "avc1.640028", 1080, 25, 6000),
@@ -414,13 +421,53 @@ func TestSizelessRepresentative(t *testing.T) {
 			want: gotRow{"1080p  mp4  ~116 MB", "-f http-1080+ba/http-1080/b[height<=1080]", "http-1080"},
 		},
 		{
-			name:     "an all-HLS group still produces a row, estimated and labelled as such",
+			name:     "a genuinely better sizeless rendition still wins",
+			duration: secs(200),
+			formats: []RawFormat{
+				// Two direct streams, so their bitrates measure the same thing
+				// and 2600 against 1600 is a better encode rather than a
+				// packaging artefact. Stating a size buys nothing here.
+				videoOnly("mp4-low", "mp4", "avc1.640028", 1080, 25, 1600, 40_000_000),
+				videoOnly("mp4-hi", "mp4", "avc1.640028", 1080, 25, 2600, 0),
+			},
+			want: gotRow{"1080p  mp4  ~69 MB", "-f mp4-hi+ba/mp4-hi/b[height<=1080]", "mp4-hi"},
+		},
+		{
+			name:     "an all-m3u8 group still produces a row, estimated and labelled as such",
 			duration: secs(200),
 			formats: []RawFormat{
 				hlsVariant("hls-a", "avc1.640028", 1080, 25, 6000),
 				hlsVariant("hls-b", "avc1.640028", 1080, 25, 4000),
 			},
 			want: gotRow{"1080p  mp4  ~154 MB", "-f hls-a+ba/hls-a/b[height<=1080]", "hls-a"},
+		},
+		{
+			name:     "an absent protocol is not read as m3u8",
+			duration: secs(200),
+			formats: []RawFormat{
+				// The extractor said nothing about how this is fetched, which
+				// is no reason to hand the row to the sibling that did. Ranking
+				// falls back to the tbr comparison it used before there was a
+				// protocol field, and 6000 wins it.
+				{
+					FormatID: "mystery-hi", Ext: "mp4", VCodec: "avc1.640028", ACodec: "none",
+					Height: 1080, FPS: 25, TBR: 6000,
+				},
+				videoOnly("mp4-direct", "mp4", "avc1.640028", 1080, 25, 1600, 40_000_000),
+			},
+			want: gotRow{"1080p  mp4  ~154 MB", "-f mystery-hi+ba/mystery-hi/b[height<=1080]", "mystery-hi"},
+		},
+		{
+			name:     "an absent protocol is not read as a direct stream either",
+			duration: secs(200),
+			formats: []RawFormat{
+				{
+					FormatID: "mystery-low", Ext: "mp4", VCodec: "avc1.640028", ACodec: "none",
+					Height: 1080, FPS: 25, TBR: 2000,
+				},
+				hlsVariant("hls-hi", "avc1.640028", 1080, 25, 6000),
+			},
+			want: gotRow{"1080p  mp4  ~154 MB", "-f hls-hi+ba/hls-hi/b[height<=1080]", "hls-hi"},
 		},
 		{
 			name:     "identical candidates fall back to the lower format id",
@@ -451,27 +498,49 @@ func TestSizelessRepresentative(t *testing.T) {
 }
 
 // TestCodecThresholdNeedsComparableSizes covers D3 against sizes of different
-// provenance: a real filesize on one side and a peak-bitrate estimate on the
-// other are not two measurements of the same thing, and a 25% gap between them
-// is as likely to be the provenance as the codec.
+// provenance. The protocol says which sizes those are: an estimate off an m3u8
+// variant's advertised peak is not measuring what a filesize measures, while an
+// estimate off a direct stream's own bitrate is the same quantity rounded.
 func TestCodecThresholdNeedsComparableSizes(t *testing.T) {
-	info := VideoInfo{
-		Duration: secs(200),
-		Formats: []RawFormat{
-			audio140(),
-			// Estimates to 150 MB off a peak tbr; the real average is anyone's
-			// guess and quite possibly under 100 MB.
-			hlsVariant("270", "avc1.640028", 1080, 25, 6000),
-			// A real 100 MB. Displayed, that is 104 MB against 154 MB — a 32%
-			// gap on paper, which is not evidence about the codec.
-			videoOnly("248", "webm", "vp09.00.40.08", 1080, 25, 4000, 100_000_000),
-		},
-	}
+	t.Run("a peak-bitrate estimate is not compared with a filesize", func(t *testing.T) {
+		info := VideoInfo{
+			Duration: secs(200),
+			Formats: []RawFormat{
+				audio140(),
+				// Estimates to 150 MB off a peak tbr; the real average is
+				// anyone's guess and quite possibly under 100 MB.
+				hlsVariant("270", "avc1.640028", 1080, 25, 6000),
+				// A real 100 MB. Displayed, that is 104 MB against 154 MB — a
+				// 32% gap on paper, which is not evidence about the codec.
+				videoOnly("248", "webm", "vp09.00.40.08", 1080, 25, 4000, 100_000_000),
+			},
+		}
 
-	rows := Rank(&info, true)
-	if rows[0].FormatID != "270" {
-		t.Errorf("chose format %q, want avc1 270: a stated size and an estimate are not comparable", rows[0].FormatID)
-	}
+		rows := Rank(&info, true)
+		if rows[0].FormatID != "270" {
+			t.Errorf("chose format %q, want avc1 270: a filesize and a peak-bitrate estimate are not comparable", rows[0].FormatID)
+		}
+	})
+
+	t.Run("an estimate off a direct stream's own bitrate is compared", func(t *testing.T) {
+		info := VideoInfo{
+			Duration: secs(200),
+			Formats: []RawFormat{
+				audio140(),
+				videoOnly("137", "mp4", "avc1.640028", 1080, 25, 4000, 100_000_000),
+				// No filesize, but 2000 kbit/s of a stream fetched directly is
+				// the bitrate it was encoded at, so 54 MB against 104 MB really
+				// is the codec saving half the file.
+				videoOnly("248", "webm", "vp09.00.40.08", 1080, 25, 2000, 0),
+			},
+		}
+
+		rows := Rank(&info, true)
+		want := gotRow{"1080p  webm  ~54 MB", "-f 248+ba/248/b[height<=1080]", "248"}
+		if got := collect(rows)[0]; got != want {
+			t.Errorf("\ngot  %+v\nwant %+v", got, want)
+		}
+	})
 }
 
 // TestAbsentCodecFieldReadings covers the two questions an empty codec field
