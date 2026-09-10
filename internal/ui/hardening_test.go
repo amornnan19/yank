@@ -274,7 +274,7 @@ func TestFitCutsBeforeItStyles(t *testing.T) {
 	forceColour(t)
 
 	long := strings.Repeat("a", 40)
-	got := fit(selectedStyle, long, 20)
+	got := fit(styles().selected, long, 20)
 
 	if lipgloss.Width(got) != 20 {
 		t.Errorf("fit produced %d visible cells, want 20: %q", lipgloss.Width(got), got)
@@ -518,5 +518,49 @@ func TestRunProgramReleasesWhateverTheLoopEndedOn(t *testing.T) {
 	}
 	if !gone(infoJSON) {
 		t.Fatalf("the info-json %s survived the program being killed", infoJSON)
+	}
+}
+
+// --- finding 6: package init must not touch the terminal --------------------
+
+// styleBuildsAtInit is styleBuilds as it stood when this test package finished
+// initialising — which is after internal/ui's own initialisation and before any
+// test has run. Reading it later is the only way to ask "did package init build
+// a style?", because by then the first View has built one and the counter has
+// moved.
+var styleBuildsAtInit = styleBuilds.Load()
+
+// TestPackageInitBuildsNoStyle is the assertion behind styles being a function.
+//
+// Package initialisation runs before main, and therefore before main installs a
+// signal handler: a signal arriving while an init is talking to the terminal
+// kills the process by its default disposition. Nothing in this package may do
+// that work at init, and a style is the piece of it this file owns.
+//
+// The counter is the evidence rather than the rendered frames, because the
+// frames are required not to change at all — laziness that showed up on screen
+// would be a different bug.
+func TestPackageInitBuildsNoStyle(t *testing.T) {
+	if styleBuildsAtInit != 0 {
+		t.Errorf("package initialisation built the style set %d times; it must be built on first use, not before main", styleBuildsAtInit)
+	}
+}
+
+// TestStylesAreBuiltOnceAndShared checks the other half: first use builds the
+// set, and every use after that is the same one. A set rebuilt per frame would
+// satisfy the test above and put style construction on the render path.
+func TestStylesAreBuiltOnceAndShared(t *testing.T) {
+	first := styles()
+	before := styleBuilds.Load()
+	if before == 0 {
+		t.Fatalf("styles() did not build the set")
+	}
+
+	second := styles()
+	if after := styleBuilds.Load(); after != before {
+		t.Errorf("styles() built the set again: %d builds, want %d", after, before)
+	}
+	if first.faint.Render("x") != second.faint.Render("x") {
+		t.Errorf("styles() handed out two different sets")
 	}
 }

@@ -29,7 +29,7 @@ const (
 	ellipsis = "…"
 )
 
-// contentWidth is how wide one line of a screen may be, docStyle's margins
+// contentWidth is how wide one line of a screen may be, the doc style's margins
 // already taken off.
 func (m Model) contentWidth() int {
 	w := m.width

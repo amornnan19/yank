@@ -15,7 +15,7 @@ const appName = "yank"
 // work a screen needs has already happened in a tea.Cmd and landed in a field.
 func (m Model) View() string {
 	if m.quitting {
-		return docStyle.Render(appStyle.Render(appName) + "\n\n" + m.quittingView())
+		return styles().doc.Render(styles().app.Render(appName) + "\n\n" + m.quittingView())
 	}
 
 	var body string
@@ -33,16 +33,16 @@ func (m Model) View() string {
 	default:
 		body = m.inputView()
 	}
-	return docStyle.Render(appStyle.Render(appName) + "\n\n" + body)
+	return styles().doc.Render(styles().app.Render(appName) + "\n\n" + body)
 }
 
 // --- screens ----------------------------------------------------------------
 
 func (m Model) inputView() string {
 	cw := m.contentWidth()
-	lines := []string{boxStyle.Width(cw - 2).Render(m.input.View())}
+	lines := []string{styles().box.Width(cw - 2).Render(m.input.View())}
 	if m.hint != "" {
-		lines = append(lines, fit(faintStyle, m.hint, cw))
+		lines = append(lines, fit(styles().faint, m.hint, cw))
 	}
 	return join(lines...) + "\n\n" + m.help("enter  fetch", "ctrl+c  quit")
 }
@@ -77,9 +77,9 @@ func (m Model) statusLine() string {
 
 func (m Model) pickerView() string {
 	cw := m.contentWidth()
-	head := []string{fit(titleStyle, m.videoTitle(), cw)}
+	head := []string{fit(styles().title, m.videoTitle(), cw)}
 	if u := strings.TrimSpace(m.info().Uploader); u != "" {
-		head = append(head, fit(faintStyle, u, cw))
+		head = append(head, fit(styles().faint, u, cw))
 	}
 
 	if len(m.rows) == 0 {
@@ -92,13 +92,13 @@ func (m Model) pickerView() string {
 		selected := i == m.cursor
 		text := pickerRowText(i, selected, row.Label)
 		if selected {
-			body = append(body, fit(selectedStyle, text, cw))
+			body = append(body, fit(styles().selected, text, cw))
 			continue
 		}
 		body = append(body, truncate(text, cw))
 	}
 	if !m.bin.HasFFmpeg {
-		body = append(body, "", faintStyle.Render(wrap(noFFmpegHint, cw)))
+		body = append(body, "", styles().faint.Render(wrap(noFFmpegHint, cw)))
 	}
 	return join(body...) + "\n\n" +
 		m.help("↑↓ jk  move", "1-9  jump", "enter  download", "esc  back")
@@ -148,8 +148,8 @@ func (m Model) noRowsExplanation() string {
 func (m Model) downloadingView() string {
 	cw := m.contentWidth()
 	lines := []string{
-		fit(titleStyle, m.videoTitle(), cw),
-		fit(faintStyle, m.row.Label, cw),
+		fit(styles().title, m.videoTitle(), cw),
+		fit(styles().faint, m.row.Label, cw),
 		"",
 		m.barLine(),
 	}
@@ -164,7 +164,7 @@ func (m Model) downloadingView() string {
 	case m.hasProg && m.prog.Phase == ytdlp.PhaseConverting:
 		lines = append(lines, m.spin.View()+" "+truncate("converting audio…", cw-2))
 	default:
-		lines = append(lines, fit(faintStyle, m.statsLine(), cw))
+		lines = append(lines, fit(styles().faint, m.statsLine(), cw))
 	}
 
 	return join(lines...) + "\n\n" + m.help("esc  cancel", "ctrl+c  quit")
@@ -215,13 +215,13 @@ func (m Model) statsLine() string {
 
 func (m Model) doneView() string {
 	cw := m.contentWidth()
-	lines := []string{fit(titleStyle, "Saved", cw), ""}
+	lines := []string{fit(styles().title, "Saved", cw), ""}
 	if m.result != nil {
 		lines = append(lines, truncate(m.result.Path, m.pathWidth()))
 		if m.result.UsedWorkingDir {
 			// DownloadsDir fell back. Saying "check your Downloads folder"
 			// would send the user to a directory the file is not in.
-			lines = append(lines, "", faintStyle.Render(wrap(workingDirNote, cw)))
+			lines = append(lines, "", styles().faint.Render(wrap(workingDirNote, cw)))
 		}
 	}
 	return join(lines...) + "\n\n" + m.help("enter  another", "q  quit")
@@ -233,7 +233,7 @@ const workingDirNote = "Your home directory could not be found, so this went to 
 func (m Model) errorView() string {
 	cw := m.contentWidth()
 	return join(
-		fit(titleStyle, "That did not work", cw),
+		fit(styles().title, "That did not work", cw),
 		"",
 		wrap(m.errMsg, cw),
 	) + "\n\n" + m.help("esc  back", "ctrl+c  quit")
@@ -261,7 +261,7 @@ func (m Model) help(entries ...string) string {
 	if line == "" && len(entries) > 0 {
 		line = truncate(entries[0], cw)
 	}
-	return faintStyle.Render(line)
+	return styles().faint.Render(line)
 }
 
 // videoTitle is the title to show, falling back to the URL for the extractors
