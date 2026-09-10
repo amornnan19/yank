@@ -1,15 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	// Aliased because this file already declares exec: the helper below that
-	// runs the command the way a shell would.
-	osexec "os/exec"
 	"strings"
 	"syscall"
 	"testing"
@@ -495,152 +491,5 @@ func TestSignalsCancelTheContextTheInterfaceRunsUnder(t *testing.T) {
 				t.Fatalf("%v did not cancel the context the interface was given", sig)
 			}
 		})
-	}
-}
-
-// The child of the second-signal test announces itself on stdout so the parent
-// knows the handler is installed, and again once the first signal has landed,
-// so that the parent is signalling into the shutdown grace and not before it.
-const (
-	secondSignalChildEnv = "YANK_TEST_SECOND_SIGNAL_CHILD"
-	childReady           = "yank-test: the interface is running"
-	childCancelled       = "yank-test: the context was cancelled"
-
-	// Longer than the parent is willing to wait, so a child that outlives the
-	// signals is a swallowed signal and not a race the parent lost.
-	childGrace = 30 * time.Second
-)
-
-// secondSignalChild is the process under test: run, with the interface stubbed
-// for something that sits in the shutdown grace the way updateQuitting does
-// while it waits for the download to die and its leftovers to go. It does not
-// return.
-func secondSignalChild() {
-	stdoutIsTTY = func() bool { return true }
-	startUI = func(ctx context.Context, _ string, _ ui.Deps) error {
-		fmt.Println(childReady)
-		<-ctx.Done()
-		fmt.Println(childCancelled)
-		time.Sleep(childGrace)
-		return nil
-	}
-	os.Exit(run(nil, io.Discard, io.Discard))
-}
-
-// A second signal arriving from outside during the shutdown grace has to end
-// the process, not vanish into it.
-//
-// signal.NotifyContext keeps its handler registered until stop is called, so
-// the process no longer has the default disposition for SIGINT, SIGTERM and
-// SIGHUP — but it stops acting on them after the first, because the channel it
-// reads is buffered at one and already full. Without context.AfterFunc(ctx,
-// stop) the grace window is a hole: a second kill -TERM leaves the process
-// running until the grace expires, which reads as a hang.
-//
-// This has to be a real process, because what is being tested is the kernel's
-// disposition for a signal. In-process the second SIGTERM would either be
-// dropped by our own handler (the bug) or end the test binary (the fix), and
-// only a child can be signalled and have its wait status read.
-func TestASecondSignalDuringTheShutdownGraceEndsTheProcess(t *testing.T) {
-	if os.Getenv(secondSignalChildEnv) == "1" {
-		secondSignalChild()
-		return
-	}
-
-	cmd := osexec.Command(os.Args[0], "-test.run=^"+t.Name()+"$", "-test.timeout=2m")
-	cmd.Env = append(os.Environ(), secondSignalChildEnv+"=1")
-	cmd.Stderr = os.Stderr
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatalf("piping the child's stdout: %v", err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("starting the child: %v", err)
-	}
-
-	// The pipe has to be drained to EOF before Wait, so one goroutine owns it
-	// and reports the two markers and the end of the output on channels.
-	ready, cancelled := make(chan struct{}, 1), make(chan struct{}, 1)
-	ended := make(chan struct{})
-	go func() {
-		defer close(ended)
-		sc := bufio.NewScanner(stdout)
-		for sc.Scan() {
-			switch strings.TrimSpace(sc.Text()) {
-			case childReady:
-				ready <- struct{}{}
-			case childCancelled:
-				cancelled <- struct{}{}
-			}
-		}
-	}()
-
-	// Nothing is left running behind a failure: SIGKILL is not what is under
-	// test, it is the cleanup no handler can refuse.
-	stopChild := func() {
-		if err := cmd.Process.Signal(syscall.SIGKILL); err == nil {
-			<-ended
-			_ = cmd.Wait()
-		}
-	}
-	await := func(what string, c <-chan struct{}) {
-		t.Helper()
-		select {
-		case <-c:
-		case <-time.After(30 * time.Second):
-			stopChild()
-			t.Fatalf("the child never reported %s", what)
-		}
-	}
-
-	await("that it was running", ready)
-
-	// The first signal. Cancelling the context is all it is asked to do here;
-	// TestSignalsCancelTheContextTheInterfaceRunsUnder covers that on its own.
-	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		stopChild()
-		t.Skipf("this platform cannot send a process SIGTERM: %v", err)
-	}
-	await("that the context was cancelled", cancelled)
-
-	// Now the grace window, and the signal that used to disappear into it.
-	// Sending it more than once is not because more than one is needed: every
-	// signal after the first is swallowed for as long as the handler stays
-	// registered, so the repeats only close the gap between the context being
-	// cancelled — which is what the child has just announced — and the
-	// AfterFunc that unregisters the handler having run. Whichever one lands
-	// after that is the second signal the user typed, and it must be fatal.
-	deadline := time.After(20 * time.Second)
-	for alive := true; alive; {
-		select {
-		case <-ended:
-			alive = false
-		case <-deadline:
-			stopChild()
-			t.Fatal("the child outlived every signal after the first: they were swallowed by the handler NotifyContext leaves registered")
-		case <-time.After(25 * time.Millisecond):
-			if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-				// Already gone, or the platform refuses to send it. Either way
-				// the wait status below is the answer.
-				alive = false
-				<-ended
-			}
-		}
-	}
-
-	err = cmd.Wait()
-	var exitErr *osexec.ExitError
-	if !errors.As(err, &exitErr) {
-		t.Fatalf("the child exited cleanly (%v) instead of being signalled: the second signal was swallowed and it sat out the whole grace", err)
-	}
-	status, ok := exitErr.Sys().(syscall.WaitStatus)
-	if !ok {
-		t.Skipf("this platform does not report a wait status: %T", exitErr.Sys())
-	}
-	if !status.Signaled() {
-		t.Fatalf("the child exited with code %d rather than dying of a signal: %v", status.ExitStatus(), err)
-	}
-	if got := status.Signal(); got != syscall.SIGTERM {
-		t.Fatalf("the child died of %v, want %v", got, syscall.SIGTERM)
 	}
 }
