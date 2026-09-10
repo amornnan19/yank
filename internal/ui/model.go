@@ -420,6 +420,13 @@ func (m Model) reset() Model {
 	fresh.width, fresh.height = m.width, m.height
 	fresh.bin, fresh.hasBin = m.bin, m.hasBin
 	fresh.seq = m.seq + 1
+	// The runs still outstanding are carried over, symmetric with seq: a
+	// yt-dlp abandoned by an earlier attempt can still be dying here, and
+	// pending is the only thing that makes a later ctrl+c wait for it to
+	// remove its .part rather than leaving one behind. Update decrements on
+	// the message whatever attempt it belonged to, so copying the count keeps
+	// it honest rather than double-counting.
+	fresh.pending = m.pending
 	fresh.layout()
 	return fresh
 }

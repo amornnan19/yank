@@ -1012,6 +1012,67 @@ func TestDoneEnterResetsEverything(t *testing.T) {
 	}
 }
 
+func TestResetKeepsAnOutstandingRunCounted(t *testing.T) {
+	// An attempt was abandoned while its yt-dlp was still dying, a later
+	// download finished, and the user pressed enter for another one. The
+	// abandoned run has still not reported back, so the ctrl+c that follows
+	// owes it the same wait it would have owed before the reset — otherwise
+	// runDownload never reaches removeLeftovers and a .part survives.
+	f := &fakes{probes: []probeOutcome{
+		{probe: newProbe(t, "Abandoned", "Nobody")},
+		{probe: newProbe(t, "The Second One", "Somebody")},
+	}}
+	m := downloadingModel(t, f)
+	abandoned := m.seq
+
+	// esc: the interface has moved on, the process has not. downloadingModel
+	// ran the download command without feeding its answer back, which is
+	// exactly a run started and not yet reported.
+	m = send(m, keyOf(tea.KeyEsc))
+	if m.pending != 1 {
+		t.Fatalf("pending = %d after esc, want the abandoned run still counted", m.pending)
+	}
+
+	// A second attempt, all the way to the done screen.
+	m = typeURL(m, "https://example.com/w")
+	m, cmd := step(m, keyOf(tea.KeyEnter))
+	m, _ = advance(t, m, cmd)
+	if m.state != statePicker {
+		t.Fatalf("state = %v, want statePicker", m.state)
+	}
+	m, cmd = step(m, keyOf(tea.KeyEnter))
+	m, _ = advance(t, m, cmd)
+	if m.state != stateDone {
+		t.Fatalf("state = %v, want stateDone", m.state)
+	}
+
+	m = send(m, keyOf(tea.KeyEnter))
+
+	if m.state != stateInput {
+		t.Fatalf("state = %v after the reset, want stateInput", m.state)
+	}
+	if m.pending != 1 {
+		t.Fatalf("pending = %d after the reset, want the abandoned run still counted", m.pending)
+	}
+
+	m, cmd = step(m, keyOf(tea.KeyCtrlC))
+
+	if quitsNow(cmd) {
+		t.Fatal("ctrl+c after a reset quit before the abandoned download had reported back")
+	}
+	if !m.quitting {
+		t.Fatal("ctrl+c after a reset did not put the model into its shutdown wait")
+	}
+
+	// And it is that run, from an attempt two generations old, that releases
+	// the wait: Update decrements on the message whatever seq it carries.
+	_, cmd = step(m, downloadDoneMsg{seq: abandoned, err: cancelledErr()})
+
+	if !quitsNow(cmd) {
+		t.Fatal("the abandoned download reported back and the program still did not quit")
+	}
+}
+
 func TestDoneQuits(t *testing.T) {
 	f := &fakes{}
 	m := downloadingModel(t, f)
