@@ -351,17 +351,25 @@ func TestPickerNavigation(t *testing.T) {
 	}
 }
 
-func TestPickerDigitJumpsAndSelects(t *testing.T) {
+func TestPickerDigitJumpsWithoutStarting(t *testing.T) {
 	f := &fakes{}
 	m := pickerModel(t, f, true, threeRows())
 
-	m = send(m, runes("2"))
+	m, cmd := step(m, runes("2"))
 
-	if m.state != stateDownloading {
-		t.Fatalf("state = %v, want stateDownloading", m.state)
+	if m.state != statePicker {
+		t.Fatalf("state = %v, want statePicker", m.state)
 	}
-	if m.row.Key != "video-720" {
-		t.Fatalf("row = %q, want the second one", m.row.Key)
+	if m.cursor != 1 {
+		t.Fatalf("cursor = %d, want the second row", m.cursor)
+	}
+	// No command at all: a digit that returned one would have launched the
+	// download the legend promises only enter can.
+	if cmd != nil {
+		t.Fatalf("digit returned a command %v, want none", collect(t, cmd))
+	}
+	if _, download, _ := f.counts(); download != 0 {
+		t.Fatalf("Download called %d times, want 0", download)
 	}
 }
 

@@ -307,9 +307,13 @@ func (m Model) pickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case s == "j":
 		m.cursor = moveCursor(m.cursor, 1, len(m.rows))
 	case len(s) == 1 && s[0] >= '1' && s[0] <= '9':
+		// The digit only moves the cursor. enter is the one key that commits,
+		// from every row and by every route: a digit is the cheapest key to
+		// press by accident and the one pressed to *look* at a row, so it must
+		// not spawn yt-dlp. A digit past the last row does nothing rather than
+		// clamping to the end — it named a row that is not on screen.
 		if n := int(s[0] - '1'); n < len(m.rows) {
 			m.cursor = n
-			return m.startDownload(m.rows[n])
 		}
 	}
 	return m, nil
