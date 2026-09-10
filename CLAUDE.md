@@ -59,6 +59,16 @@ re-execs and a descendant inherits the pipes — set `cmd.WaitDelay`, and then
 remember that `WaitDelay` returns `exec.ErrWaitDelay` on an otherwise
 successful exit.
 
+**A signal is not a ctrl+c.** The model's shutdown grace — `quit`,
+`updateQuitting`, `quitGrace` — runs only for a ctrl+c *key press*. An external
+SIGINT, SIGTERM or SIGHUP never reaches `Update`: `tea.WithContext` returns from
+`eventLoop` on `ctx.Done()`, and Bubble Tea's own handler turns SIGINT into
+`InterruptMsg` and SIGTERM into `QuitMsg`, both of which `eventLoop` consumes
+itself. What a signal gets instead is `releaseFinal`, on the model the loop
+ended on. Anything reasoning about "the shutdown window" has to say which of the
+two routes it means; an issue written on the wrong one has already cost a
+release round.
+
 **Remote text is not safe to print.** Titles, uploaders and yt-dlp's own error
 messages come from a page we did not write. Strip control characters and escape
 sequences before measuring or rendering them. `lipgloss.Width` is a display-width
