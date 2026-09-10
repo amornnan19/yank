@@ -546,21 +546,31 @@ func TestPackageInitBuildsNoStyle(t *testing.T) {
 	}
 }
 
-// TestStylesAreBuiltOnceAndShared checks the other half: first use builds the
-// set, and every use after that is the same one. A set rebuilt per frame would
-// satisfy the test above and put style construction on the render path.
-func TestStylesAreBuiltOnceAndShared(t *testing.T) {
-	first := styles()
+// TestStylesAreBuiltOnceOnFirstUse checks the other half: first use builds the
+// set and nothing builds it again. A set rebuilt per frame would satisfy the
+// test above and put style construction on the render path.
+//
+// The counter is the whole of the evidence, and that is a limit worth writing
+// down rather than papering over: whether two callers get the *same* set cannot
+// be observed from here. styles() returns a styleSet by value, so the sets two
+// calls hand back are copies even when the implementation is right, and under
+// lipgloss v1.1.0 a Style is a plain value struct — a props bitset, ints, nil
+// colours, and a pointer to the one package-level renderer. Two independently
+// constructed styles are therefore reflect.DeepEqual and render byte-identical,
+// while == does not compile at all (the struct holds a func field). Measured
+// against a styles() deliberately rebuilt on every call: the counter below
+// caught it, and DeepEqual on the whole set, on faint, and on box all still
+// reported equal. A comparison of the returned values would pass whether or not
+// the set is shared, so this test does not make one.
+func TestStylesAreBuiltOnceOnFirstUse(t *testing.T) {
+	styles()
 	before := styleBuilds.Load()
 	if before == 0 {
 		t.Fatalf("styles() did not build the set")
 	}
 
-	second := styles()
+	styles()
 	if after := styleBuilds.Load(); after != before {
 		t.Errorf("styles() built the set again: %d builds, want %d", after, before)
-	}
-	if first.faint.Render("x") != second.faint.Render("x") {
-		t.Errorf("styles() handed out two different sets")
 	}
 }
