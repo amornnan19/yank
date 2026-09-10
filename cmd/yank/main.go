@@ -168,6 +168,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// kills the process outright and leaves the info-json behind. Bubble Tea
 	// installs its own handler for SIGINT and SIGTERM but not for SIGHUP.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	// Hand the signals back to the kernel the moment the first one lands.
+	// NotifyContext keeps its handler registered until stop is called, but it
+	// only ever acts once: the channel it reads is buffered at one and already
+	// full, so every later SIGINT, SIGTERM or SIGHUP is delivered to a handler
+	// that does nothing with it. The window that matters is the shutdown grace,
+	// while the UI waits for yt-dlp to die and its leftovers to go — precisely
+	// when somebody who has lost patience types kill a second time, and having
+	// it swallowed reads as a hang. Restoring the default disposition here
+	// means the second signal kills the process at once. A second ctrl+c inside
+	// the UI is a key press, not a signal, and the model already handles it.
+	context.AfterFunc(ctx, stop)
+	// The exit paths that see no signal at all — pressing q, ui.Run failing —
+	// never cancel ctx, so AfterFunc never runs for them and stop still needs a
+	// defer. Calling it twice is harmless: it cancels an already-cancelled
+	// context and stops an already-stopped channel.
 	defer stop()
 
 	err := startUI(ctx, url, ui.Production())
