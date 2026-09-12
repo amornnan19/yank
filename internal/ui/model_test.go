@@ -389,10 +389,15 @@ func pickerModel(t *testing.T, f *fakes, hasFFmpeg bool, rows []ytdlp.Row) Model
 	return m
 }
 
+// threeRows is the picker fixture. Each row carries the fields its Label was
+// joined from, the way Rank's rows do, because the picker lays the fields out
+// as columns and falls back to Label only when they do not fit.
 func threeRows() []ytdlp.Row {
 	return []ytdlp.Row{
-		{Key: "video-1080", Label: "1080p60  mp4  ~142 MB", Args: []string{"-f", "137+ba"}},
-		{Key: "video-720", Label: "720p  mp4  ~64 MB", Args: []string{"-f", "22"}},
+		{Key: "video-1080", Label: "1080p60  mp4  ~142 MB", Args: []string{"-f", "137+ba"},
+			Height: 1080, FPS: 60, Ext: "mp4", Bytes: 142_000_000, SizeKnown: true},
+		{Key: "video-720", Label: "720p  mp4  ~64 MB", Args: []string{"-f", "22"},
+			Height: 720, FPS: 30, Ext: "mp4", Bytes: 64_000_000, SizeKnown: true},
 		{Key: "audio-mp3", Label: "audio only  mp3", Args: []string{"-x"}, AudioOnly: true},
 	}
 }

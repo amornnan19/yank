@@ -158,6 +158,23 @@ func screens(t *testing.T) map[string]Model {
 	return out
 }
 
+func TestDoneAndErrorScreensCarryTheirGlyphs(t *testing.T) {
+	// The glyph is the signal a terminal rendering no colour still shows; the
+	// words after it are the ones #7 settled and must not move.
+	f := &fakes{}
+	done := downloadingModel(t, f)
+	done = send(done, downloadDoneMsg{seq: done.seq, res: &ytdlp.DownloadResult{Path: "/x/a.mp4"}})
+	if !strings.Contains(done.View(), "✓ Saved") {
+		t.Errorf("the done screen does not read \"✓ Saved\":\n%s", done.View())
+	}
+
+	failed := downloadingModel(t, &fakes{})
+	failed = send(failed, downloadDoneMsg{seq: failed.seq, err: hardErr()})
+	if !strings.Contains(failed.View(), "✗ That did not work") {
+		t.Errorf("the error screen does not read \"✗ That did not work\":\n%s", failed.View())
+	}
+}
+
 func TestInputScreenFramesTheBoxAndNamesTheApp(t *testing.T) {
 	f := &fakes{}
 	m := testModel(t, f, 80)
@@ -188,6 +205,33 @@ func TestPickerMarksTheSelectionAndNumbersTheRows(t *testing.T) {
 	}
 	if !strings.Contains(view, "Rick Astley") {
 		t.Fatalf("the uploader is missing:\n%s", view)
+	}
+}
+
+func TestPickerLaysTheRowsOutInColumns(t *testing.T) {
+	// Each column is as wide as its widest value: "audio only" sets the
+	// quality column, and the sizes line up on their unit because the column
+	// is right-aligned. The audio row's Label carries no size, so its cell is
+	// blank rather than "~?".
+	const cw = 76
+	want := []string{
+		padRight("▸ 1. 1080p60     mp4  ~142 MB", cw),
+		"  2. 720p        mp4   ~64 MB",
+		"  3. audio only  mp3",
+	}
+	if got := pickerLines(threeRows(), 0, cw); !equalLines(got, want) {
+		t.Errorf("pickerLines:\n got %q\nwant %q", got, want)
+	}
+
+	m := pickerModel(t, &fakes{}, true, threeRows())
+	view := m.View()
+	for _, line := range want[1:] {
+		if !strings.Contains(view, line) {
+			t.Errorf("the picker does not show %q:\n%s", line, view)
+		}
+	}
+	if !strings.Contains(view, want[0]) {
+		t.Errorf("the selected row is not padded to the content width:\n%s", view)
 	}
 }
 

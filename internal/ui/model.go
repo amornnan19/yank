@@ -120,14 +120,10 @@ func New(ctx context.Context, deps Deps, startURL string) Model {
 	in := textinput.New()
 	in.Placeholder = "https://www.youtube.com/watch?v=…"
 	in.Prompt = ""
+	// textinput's own placeholder default is lipgloss.Color("240"), a fixed
+	// 256-cube grey, which is the one kind of colour styles.go rules out.
+	in.PlaceholderStyle = styles().faint
 	in.Focus()
-
-	// A solid fill with no colour, and an empty fill with none either, leaves
-	// the bar in the terminal's own foreground. The defaults are a purple ramp
-	// and a #606060 grey, and a fixed grey is exactly the thing that disappears
-	// on one of the two backgrounds people use.
-	bar := progress.New(progress.WithoutPercentage(), progress.WithSolidFill(""))
-	bar.EmptyColor = ""
 
 	m := Model{
 		deps:     deps,
@@ -136,7 +132,7 @@ func New(ctx context.Context, deps Deps, startURL string) Model {
 		width:    defaultWidth,
 		input:    in,
 		spin:     spinner.New(spinner.WithSpinner(spinner.MiniDot)),
-		bar:      bar,
+		bar:      newBar(),
 		startURL: startURL,
 	}
 	if startURL != "" {
@@ -144,6 +140,24 @@ func New(ctx context.Context, deps Deps, startURL string) Model {
 	}
 	m.layout()
 	return m
+}
+
+// newBar builds the progress bar. The fill is ANSI blue, the terminal's own
+// slot 4, for the reason styles.go gives; the gradient options are not used
+// because WithDefaultGradient and WithGradient are hex ramps. The empty segment
+// is left in the terminal's foreground rather than given a colour: the natural
+// candidate, bright black, is the background colour itself on Solarized Dark,
+// and an empty bar that disappears there is the fixed-grey problem again.
+//
+// extra is for tests. progress.New records the colour profile of the real
+// stdout when it is called, which under `go test` is Ascii whatever lipgloss
+// has been told, so a test that wants to see the bar's escape sequences passes
+// progress.WithColorProfile here rather than rebuilding the bar itself.
+func newBar(extra ...progress.Option) progress.Model {
+	opts := append([]progress.Option{progress.WithoutPercentage(), progress.WithSolidFill(ansiBlue)}, extra...)
+	bar := progress.New(opts...)
+	bar.EmptyColor = ""
+	return bar
 }
 
 // Init starts the cursor blinking. Nothing is resolved or fetched until a URL

@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"io"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 
 	"github.com/amornnan19/yank/internal/ytdlp"
 )
@@ -185,9 +189,10 @@ func assertRenderedSafely(t *testing.T, name, view string, width int) {
 //
 // `go test` writes to a pipe, so the default profile is Ascii and every style
 // renders as the identity — which is precisely the condition that hides a
-// style-then-truncate. The profile value is stepped down from the one lipgloss
-// already hands out rather than named, because naming it would mean importing
-// termenv, and CLAUDE.md allows this module three third-party dependencies.
+// style-then-truncate. The profile is stepped down to the first one that emits
+// an escape rather than set outright: these tests are about where the cut
+// falls, and the nearest profile above Ascii shows that. trueColour below is
+// the one that names a profile, because the palette rule needs the richest.
 func forceColour(t *testing.T) {
 	t.Helper()
 	original := lipgloss.ColorProfile()
@@ -242,31 +247,32 @@ func TestTheSelectedRowIsTruncatedBeforeItIsStyled(t *testing.T) {
 	}
 }
 
-func TestPickerRowTextIsPlainAndTheSameWidthEitherWay(t *testing.T) {
-	// Colour is forced because the assertion below is that pickerRowText does
+func TestPickerLinesArePlainAndNoWiderThanTheColumn(t *testing.T) {
+	// Colour is forced because the assertion below is that pickerLines does
 	// not style: at the Ascii profile a Render inside it would be the identity
 	// and there would be nothing to see.
 	forceColour(t)
 
 	rows := threeRows()
-	// Narrow enough that both rows are cut; a row that fits is not evidence
-	// about how a cut one is built.
-	const w = 20
-	// Asserted on the raw value, before truncate: truncate sanitises, so it
-	// would strip a stray escape sequence and hide the very thing under test.
-	for i, raw := range []string{pickerRowText(0, true, rows[0].Label), pickerRowText(1, false, rows[1].Label)} {
-		if strings.ContainsRune(raw, escape) {
-			t.Errorf("pickerRowText(%d) = %q is already styled; styling is fit's job, after the cut", i, raw)
+	for _, w := range []int{20, 76} {
+		// 20 is narrow enough that every row is cut; 76 is the aligned layout.
+		// A row that fits is not evidence about how a cut one is built, and
+		// the other way round.
+		lines := pickerLines(rows, 0, w)
+		if len(lines) != len(rows) {
+			t.Fatalf("pickerLines returned %d lines for %d rows", len(lines), len(rows))
 		}
-	}
-
-	sel := truncate(pickerRowText(0, true, rows[0].Label), w)
-	unsel := truncate(pickerRowText(1, false, rows[1].Label), w)
-	if lipgloss.Width(sel) != w {
-		t.Errorf("the selected row is %d cells, want the full %d", lipgloss.Width(sel), w)
-	}
-	if lipgloss.Width(sel) != lipgloss.Width(unsel) {
-		t.Errorf("cut rows differ in width: %d vs %d", lipgloss.Width(sel), lipgloss.Width(unsel))
+		for i, line := range lines {
+			if strings.ContainsRune(line, escape) {
+				t.Errorf("pickerLines(%d)[%d] = %q is already styled; styling is fit's job, after the cut", w, i, line)
+			}
+			if lipgloss.Width(line) > w {
+				t.Errorf("pickerLines(%d)[%d] = %q is %d cells wide", w, i, line, lipgloss.Width(line))
+			}
+		}
+		if lipgloss.Width(lines[0]) != w {
+			t.Errorf("at width %d the selected row is %d cells, want the full %d so its reverse block spans the row: %q", w, lipgloss.Width(lines[0]), w, lines[0])
+		}
 	}
 }
 
@@ -573,4 +579,226 @@ func TestStylesAreBuiltOnceOnFirstUse(t *testing.T) {
 	if after := styleBuilds.Load(); after != before {
 		t.Errorf("styles() built the set again: %d builds, want %d", after, before)
 	}
+}
+
+// --- finding 7: colour, on a real profile -----------------------------------
+
+// sgr matches one Select Graphic Rendition sequence and captures its
+// parameters.
+var sgr = regexp.MustCompile(`\x1b\[([0-9;]*)m`)
+
+// allowedSGR is every SGR parameter a style built from the terminal's own
+// sixteen colours can produce: reset, bold, faint, underline, reverse and
+// their offs, and the 30-37/90-97 foregrounds and 40-47/100-107 backgrounds
+// with their defaults. 38 and 48 — the introducers for a 256-cube or a
+// truecolor value — are the ones the palette rule forbids, and they are absent
+// from this set on purpose.
+var allowedSGR = func() map[int]bool {
+	ok := map[int]bool{0: true, 1: true, 2: true, 4: true, 7: true, 22: true, 24: true, 27: true, 39: true, 49: true}
+	for _, base := range []int{30, 40, 90, 100} {
+		for i := range 8 {
+			ok[base+i] = true
+		}
+	}
+	return ok
+}()
+
+// trueColour makes lipgloss render at the richest profile there is, which is
+// where a hex or 256-cube colour would show up as one. forceColour steps down
+// to whatever first emits an escape, and that is ANSI under `go test`, where a
+// Color("240") is quietly degraded to a 16-colour approximation and passes.
+func trueColour(t *testing.T) {
+	t.Helper()
+	original := lipgloss.ColorProfile()
+	t.Cleanup(func() { lipgloss.SetColorProfile(original) })
+	lipgloss.SetColorProfile(termenv.TrueColor)
+}
+
+// colourScreens is screens plus the states that only differ by a style: the
+// first-run wording, the converting phase, the done screen without its note,
+// and a picker with the cursor moved. Every model gets a bar that renders at
+// TrueColor, because progress.New reads the real stdout's profile and would
+// otherwise draw the bar plain whatever lipgloss was told.
+func colourScreens(t *testing.T) map[string]Model {
+	t.Helper()
+	out := screens(t)
+
+	firstRun := testModel(t, &fakes{}, 80)
+	firstRun.hasBin = true
+	firstRun = typeURL(firstRun, "https://example.com/v")
+	firstRun = send(firstRun, keyOf(tea.KeyEnter))
+	firstRun.firstRun = true
+	out["probing first run"] = firstRun
+
+	moved := pickerModel(t, &fakes{}, true, threeRows())
+	moved = send(moved, runes("j"))
+	out["picker cursor moved"] = moved
+
+	converting := downloadingModel(t, &fakes{})
+	converting = send(converting, progressMsg{seq: converting.seq, p: ytdlp.Progress{
+		Phase: ytdlp.PhaseConverting, Downloaded: 4_000_000, DownloadedKnown: true,
+		Total: 4_000_000, TotalKnown: true,
+	}})
+	out["converting"] = converting
+
+	done := downloadingModel(t, &fakes{})
+	done = send(done, downloadDoneMsg{seq: done.seq, res: &ytdlp.DownloadResult{Path: "/Users/x/Downloads/a b.mp4"}})
+	out["done without note"] = done
+
+	for name, m := range out {
+		m.bar = newBar(progress.WithColorProfile(termenv.TrueColor))
+		out[name] = m
+	}
+	return out
+}
+
+func TestEveryScreenUsesOnlyTheTerminalsOwnPalette(t *testing.T) {
+	trueColour(t)
+
+	for _, width := range []int{80, 120, 24} {
+		for name, m := range colourScreens(t) {
+			m = send(m, tea.WindowSizeMsg{Width: width, Height: 24})
+			view := m.View()
+			if !strings.ContainsRune(view, escape) {
+				t.Fatalf("%s at width %d rendered no escape sequence at TrueColor; the profile is not in effect and this test can see nothing", name, width)
+			}
+			for n, line := range strings.Split(view, "\n") {
+				assertLineIsPaletteSafe(t, name, width, n, line)
+			}
+		}
+	}
+}
+
+// assertLineIsPaletteSafe is the palette rule and the fit rule for one rendered
+// line: only the allowed SGR parameters, no escape sequence that is not an SGR,
+// no wider than the terminal once the sequences are discounted, and a reset
+// closing whatever was opened so nothing bleeds into the line below.
+func assertLineIsPaletteSafe(t *testing.T, name string, width, n int, line string) {
+	t.Helper()
+	where := name + " at width " + strconv.Itoa(width) + " line " + strconv.Itoa(n)
+
+	matches := sgr.FindAllStringSubmatch(line, -1)
+	for _, m := range matches {
+		for _, param := range strings.Split(m[1], ";") {
+			if param == "" {
+				continue // ESC[m is a reset
+			}
+			v, err := strconv.Atoi(param)
+			if err != nil || !allowedSGR[v] {
+				t.Errorf("%s carries SGR parameter %q in %q, outside the sixteen-colour palette:\n%q", where, param, m[0], line)
+			}
+		}
+	}
+	if stripped := sgr.ReplaceAllString(line, ""); strings.ContainsRune(stripped, escape) {
+		t.Errorf("%s carries an escape sequence that is not an SGR:\n%q", where, line)
+	}
+	if got := lipgloss.Width(line); got > width {
+		t.Errorf("%s is %d cells wide:\n%q", where, got, line)
+	}
+	if len(matches) > 0 {
+		last := matches[len(matches)-1][1]
+		if last != "" && last != "0" {
+			t.Errorf("%s opens a style it does not close; the last SGR is %q:\n%q", where, matches[len(matches)-1][0], line)
+		}
+	}
+}
+
+func TestTheSelectedRowsReverseBlockSpansTheContentWidth(t *testing.T) {
+	trueColour(t)
+
+	f := &fakes{}
+	m := pickerModel(t, f, true, threeRows())
+	for _, width := range []int{80, 40} {
+		m = send(m, tea.WindowSizeMsg{Width: width, Height: 24})
+		cw := m.contentWidth()
+
+		// The unstyled text first: it is what the style is applied to.
+		lines := pickerLines(m.rows, m.cursor, cw)
+		if got := lipgloss.Width(lines[m.cursor]); got != cw {
+			t.Errorf("at width %d the selected row's text is %d cells, want %d: %q", width, got, cw, lines[m.cursor])
+		}
+		for i, line := range lines {
+			if i != m.cursor && lipgloss.Width(line) > cw {
+				t.Errorf("at width %d row %d is %d cells, wider than %d: %q", width, i, lipgloss.Width(line), cw, line)
+			}
+		}
+
+		// Then the rendered frame: the cells between the reverse being switched
+		// on and the reset must be the same count, or the block stops short.
+		reversed := regexp.MustCompile(`\x1b\[[0-9;]*7[0-9;]*m(.*?)\x1b\[0?m`).FindStringSubmatch(m.View())
+		if reversed == nil {
+			t.Fatalf("at width %d no reverse-video block in:\n%q", width, m.View())
+		}
+		if got := lipgloss.Width(reversed[1]); got != cw {
+			t.Errorf("at width %d the reverse block covers %d cells, want %d: %q", width, got, cw, reversed[1])
+		}
+	}
+}
+
+func TestPickerColumnsFallBackToTheLabel(t *testing.T) {
+	// A size that was never pinned down, spelled the way the Label spells it,
+	// and right-aligned under the one that was.
+	rows := []ytdlp.Row{
+		{Label: "1080p60  mp4  ~142 MB", Height: 1080, FPS: 60, Ext: "mp4", Bytes: 142_000_000, SizeKnown: true},
+		{Label: "720p  webm  ~?", Height: 720, FPS: 24, Ext: "webm"},
+	}
+	want := []string{
+		padRight("▸ 1. 1080p60  mp4   ~142 MB", 60),
+		"  2. 720p     webm       ~?",
+	}
+	if got := pickerLines(rows, 0, 60); !equalLines(got, want) {
+		t.Errorf("pickerLines with an unknown size:\n got %q\nwant %q", got, want)
+	}
+
+	// A Label the columns cannot fit under a narrow width: every row falls
+	// back to its Label, cut to the width, and the list is no wider than it
+	// was before the columns existed.
+	long := ytdlp.Row{
+		Label:  "2160p60  " + strings.Repeat("x", 40) + "  ~9.8 GB",
+		Height: 2160, FPS: 60, Ext: strings.Repeat("x", 40), Bytes: 9_800_000_000, SizeKnown: true,
+	}
+	rows = []ytdlp.Row{rows[0], long, rows[1]}
+	const w = 20
+	want = []string{
+		"  1. 1080p60  mp4  " + ellipsis,
+		"▸ 2. 2160p60  xxxxx" + ellipsis,
+		"  3. 720p  webm  ~?",
+	}
+	got := pickerLines(rows, 1, w)
+	if !equalLines(got, want) {
+		t.Errorf("pickerLines under a width the columns cannot fit:\n got %q\nwant %q", got, want)
+	}
+	for i, line := range got {
+		if lipgloss.Width(line) > w {
+			t.Errorf("row %d is %d cells at width %d: %q", i, lipgloss.Width(line), w, line)
+		}
+	}
+}
+
+func TestPickerColumnsSanitiseTheContainer(t *testing.T) {
+	// Ext is remote text like everything else on the row, and it is measured
+	// to size its column before truncate ever sees it.
+	rows := []ytdlp.Row{
+		{Label: "720p  mp4  ~64 MB", Height: 720, Ext: "mp\x1b[31m4", Bytes: 64_000_000, SizeKnown: true},
+		{Label: "audio only  mp3", AudioOnly: true},
+	}
+	want := []string{
+		padRight("▸ 1. 720p        mp4  ~64 MB", 40),
+		"  2. audio only  mp3",
+	}
+	if got := pickerLines(rows, 0, 40); !equalLines(got, want) {
+		t.Errorf("pickerLines with a hostile container:\n got %q\nwant %q", got, want)
+	}
+}
+
+func equalLines(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
