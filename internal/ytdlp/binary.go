@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
@@ -114,6 +115,13 @@ func Resolve(ctx context.Context) (Result, error) {
 // give it a buffer of one — and the channel is closed before ResolveWith
 // returns, which means it must not be shared between calls.
 func ResolveWith(ctx context.Context, events chan<- ResolveEvent) (Result, error) {
+	return resolveWith(ctx, events, versionTimeout, waitDelay, releaseBase)
+}
+
+// resolveWith is ResolveWith with the probe durations and the release URL
+// injected, so tests can drive the whole cache-then-download path against a
+// fake binary and a local server without production timeouts or the network.
+func resolveWith(ctx context.Context, events chan<- ResolveEvent, timeout, delay time.Duration, base string) (Result, error) {
 	if events != nil {
 		defer close(events)
 	}
@@ -122,7 +130,7 @@ func ResolveWith(ctx context.Context, events chan<- ResolveEvent) (Result, error
 	res.FFmpegPath, res.HasFFmpeg = FindFFmpeg()
 
 	if path, err := exec.LookPath("yt-dlp"); err == nil {
-		if version, err := probeVersion(ctx, path); err == nil {
+		if version, err := probeVersionWith(ctx, path, timeout, delay); err == nil {
 			res.Path, res.Version, res.Source = path, version, SourcePATH
 			return res, nil
 		}
@@ -147,7 +155,8 @@ func ResolveWith(ctx context.Context, events chan<- ResolveEvent) (Result, error
 			return res, nil
 		}
 	}
-	if version, err := probeVersion(ctx, cached); err == nil {
+	version, probeErr := probeVersionWith(ctx, cached, timeout, delay)
+	if probeErr == nil {
 		if statErr == nil {
 			recordVersion(cached, info, version)
 		}
@@ -157,6 +166,26 @@ func ResolveWith(ctx context.Context, events chan<- ResolveEvent) (Result, error
 	if err := ctx.Err(); err != nil {
 		return Result{}, fmt.Errorf("could not fetch yt-dlp: %w", err)
 	}
+	// A failed probe of the cached copy is classified before anything is
+	// fetched (#18). Only two outcomes justify a download: the stat taken
+	// before the probe found nothing, or the file is positively not a working
+	// yt-dlp. A timeout, a signal we did not send, pipes cut before any
+	// output, or an OS refusal to start it say nothing about a file that was
+	// checksum-verified when it was installed, and downloading over it would
+	// be the branch the cached artifacts rule forbids.
+	switch {
+	case isMissing(statErr):
+		// Nothing is cached, so the download is a first run, not a
+		// replacement.
+	case isBadBinary(probeErr):
+		// The file itself is at fault. The download's rename would replace it
+		// anyway; removing it now, with its sidecar, means a download that
+		// fails cannot leave a record describing a file it no longer matches.
+		discardBinary(cached)
+	default:
+		// The probe error already names the path.
+		return Result{}, fmt.Errorf("could not use the cached yt-dlp (kept; retry, or delete it to force a fresh download): %w", probeErr)
+	}
 
 	if events != nil {
 		select {
@@ -164,12 +193,12 @@ func ResolveWith(ctx context.Context, events chan<- ResolveEvent) (Result, error
 		default:
 		}
 	}
-	if err := download(ctx, cached); err != nil {
+	if err := downloadFrom(ctx, base, cached); err != nil {
 		return Result{}, err
 	}
 
 	info, statErr = os.Stat(cached)
-	version, err := probeVersion(ctx, cached)
+	version, err = probeVersionWith(ctx, cached, timeout, delay)
 	if err != nil {
 		if !isBadBinary(err) {
 			// A cancellation, a probe timeout or an OS refusal says nothing
@@ -360,6 +389,18 @@ func isBadBinary(err error) bool {
 	return errors.As(err, &pe) && pe.badBinary
 }
 
+// isMissing reports whether the stat taken before the probe found no file at
+// all, the one outcome that makes a download a first run rather than a
+// replacement. It reads the stat error and not the exec error on purpose:
+// execve answers ENOENT for a present file whose #! interpreter or ELF loader
+// is absent (a glibc build on a musl host, say), and errors.Is(fs.ErrNotExist)
+// is true for both. Deciding from the exec error would download over a
+// present, verified file and then report it as not there. Not a verdict on
+// the file either way, so deliberately not part of isBadBinary.
+func isMissing(statErr error) bool {
+	return errors.Is(statErr, fs.ErrNotExist)
+}
+
 // probeVersion runs path with --version and returns what it printed.
 func probeVersion(ctx context.Context, path string) (string, error) {
 	return probeVersionWith(ctx, path, versionTimeout, waitDelay)
@@ -443,16 +484,17 @@ func classifyProbe(path string, out []byte, runErr, callerCtxErr, probeCtxErr er
 	return "", &probeError{fmt.Errorf("%s --version failed: %w", path, runErr), false}
 }
 
-// download fetches the release asset for this platform, checks it against the
-// release's SHA2-256SUMS, and atomically moves it to dest. The download lands
-// in a unique temp file inside dest's directory first, so an interrupted run
-// cannot leave a half-written file at dest and two yank processes racing on
-// first run cannot write to the same path.
-func download(ctx context.Context, dest string) error {
+// downloadFrom fetches the release asset for this platform from base, checks
+// it against the release's SHA2-256SUMS, and atomically moves it to dest. The
+// download lands in a unique temp file inside dest's directory first, so an
+// interrupted run cannot leave a half-written file at dest and two yank
+// processes racing on first run cannot write to the same path. base is
+// releaseBase in production; tests point it at a local server.
+func downloadFrom(ctx context.Context, base, dest string) error {
 	client := &http.Client{Timeout: httpTimeout}
 	asset := assetName(runtime.GOOS, runtime.GOARCH)
 
-	sums, err := fetch(ctx, client, releaseBase+checksumsAsset, maxChecksumsBytes)
+	sums, err := fetch(ctx, client, base+checksumsAsset, maxChecksumsBytes)
 	if err != nil {
 		return fmt.Errorf("could not fetch yt-dlp: %w", err)
 	}
@@ -475,7 +517,7 @@ func download(ctx context.Context, dest string) error {
 		os.Remove(tmpName)
 	}()
 
-	got, err := fetchTo(ctx, client, releaseBase+asset, maxBinaryBytes, tmp)
+	got, err := fetchTo(ctx, client, base+asset, maxBinaryBytes, tmp)
 	if err != nil {
 		return fmt.Errorf("could not fetch yt-dlp: %w", err)
 	}

@@ -25,7 +25,10 @@ error must separate a *positive* failure — the process ran and refused — fro
 *inconclusive* one: the caller cancelled, our own timeout fired, a signal we did
 not send killed it (`ExitCode() < 0`), or `exec.ErrWaitDelay` cut the pipes. Only
 a positive failure may be reported as the URL's or the file's fault.
-`classifyProbe` in `binary.go` is the reference.
+`classifyProbe` in `binary.go` is the reference. `ENOENT` from `execve` is not
+proof a file is missing: a present file with an absent interpreter or ELF
+loader fails the same way. Decide "nothing is cached" from the `os.Stat` taken
+before the probe, never from the exec error alone.
 
 **Exit codes are classified positively too.** `tea.ErrProgramKilled` is not proof
 of a clean shutdown: `Program.Run` wraps *every* error the event loop produced in

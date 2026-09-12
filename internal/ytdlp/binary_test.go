@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -497,6 +500,14 @@ func TestProbeVersionMissingFileIsNotBadBinary(t *testing.T) {
 // Resolve did not execute it.
 func cachedFake(t *testing.T, version string) (binary, runLog string) {
 	t.Helper()
+	return cachedFakeScript(t, "echo "+version+"\n")
+}
+
+// cachedFakeScript is cachedFake with the script's body supplied, for fakes
+// that hang or refuse instead of answering. The run log line comes first, so
+// the count is right however the body ends.
+func cachedFakeScript(t *testing.T, body string) (binary, runLog string) {
+	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("needs a POSIX shell")
 	}
@@ -510,7 +521,7 @@ func cachedFake(t *testing.T, version string) (binary, runLog string) {
 	}
 	binary = filepath.Join(dir, binaryName(runtime.GOOS))
 	runLog = filepath.Join(root, "runs.log")
-	script := fmt.Sprintf("#!/bin/sh\necho run >> '%s'\necho %s\n", runLog, version)
+	script := fmt.Sprintf("#!/bin/sh\necho run >> '%s'\n%s", runLog, body)
 	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -629,13 +640,13 @@ func TestRecordedVersionRequiresAnExecutableFile(t *testing.T) {
 
 func TestResolveDoesNotTrustTheSidecarOfANonExecutableFile(t *testing.T) {
 	// The same shape through Resolve. Once the sidecar is distrusted the path
-	// is the pre-existing one — the probe fails with permission denied, which
-	// is not the file's fault, and Resolve falls through to a download. The
-	// download is a live fetch this test must not perform, so the context is
-	// cancelled up front: the probe reports the cancellation instead, and
-	// Resolve stops at the ctx.Err() check before fetching. A Resolve that
-	// trusted the sidecar would never look at the context and would answer
-	// from the record.
+	// is the pre-existing one — the probe runs and fails with permission
+	// denied, which is not the file's fault. The context is cancelled up
+	// front so the probe reports the cancellation and Resolve stops at the
+	// ctx.Err() check; what an uncancelled run does with the refusal is
+	// TestResolveKeepsTheCachedBinaryWhenTheOSRefusesToStartIt. A Resolve
+	// that trusted the sidecar would never look at the context and would
+	// answer from the record.
 	binary, _ := cachedFake(t, "2026.09.01")
 	writeSidecar(t, binary, currentRecord(t, binary, "2026.08.19"))
 	if err := os.Chmod(binary, 0o644); err != nil {
@@ -756,6 +767,231 @@ func TestDiscardBinaryRemovesTheSidecarToo(t *testing.T) {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("%s still present after discardBinary: %v", filepath.Base(path), err)
 		}
+	}
+}
+
+// --- classifying a failed cache probe (#18) ---------------------------------
+
+// noFetch is a release base that fails the test the moment anything is fetched
+// from it. It is the proof that Resolve did not start a download.
+func noFetch(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("Resolve fetched %s: a download was started", r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL + "/"
+}
+
+// refusingRelease is a release base that answers every request with 404 and
+// counts them, so a test can prove a download was attempted without serving
+// a binary.
+func refusingRelease(t *testing.T) (base string, hits *int) {
+	t.Helper()
+	hits = new(int)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*hits++
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL + "/", hits
+}
+
+// fileState is the size and mtime of a file, the two things the sidecar
+// records and the two things a re-download would change.
+type fileState struct {
+	size    int64
+	mtimeNS int64
+}
+
+func stateOf(t *testing.T, path string) fileState {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", filepath.Base(path), err)
+	}
+	return fileState{info.Size(), info.ModTime().UnixNano()}
+}
+
+// assertKept checks that an inconclusive probe left the cached binary exactly
+// as it was and told the user where the file is and what they can do.
+func assertKept(t *testing.T, err error, binary string, before fileState) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("Resolve returned no error")
+	}
+	if isBadBinary(err) {
+		t.Errorf("isBadBinary(%v) = true, want false: this outcome is inconclusive", err)
+	}
+	if !strings.Contains(err.Error(), "(kept; retry, or delete it to force a fresh download)") {
+		t.Errorf("error = %q, want it to say the file was kept and how to force a download", err)
+	}
+	if !strings.Contains(err.Error(), binary) {
+		t.Errorf("error = %q, want it to name %s", err, binary)
+	}
+	if after := stateOf(t, binary); after != before {
+		t.Errorf("cached binary changed from %+v to %+v; it must be untouched", before, after)
+	}
+}
+
+// assertSidecarKept checks that the pre-existing sidecar is still in place.
+func assertSidecarKept(t *testing.T, binary string, sidecar versionRecord) {
+	t.Helper()
+	if got := readSidecar(t, binary); got != sidecar {
+		t.Errorf("sidecar = %+v, want the pre-existing %+v left in place", got, sidecar)
+	}
+}
+
+func TestResolveKeepsTheCachedBinaryWhenTheProbeTimesOut(t *testing.T) {
+	// The slow-machine case from #18: the PyInstaller unpack outlives
+	// versionTimeout. The sidecar's size is off by one so the record is
+	// distrusted and the probe actually runs. sleep is spelled with its path
+	// because cachedFake empties PATH, and a "sleep: not found" exit 127 would
+	// be a positive failure, not a timeout. The timeout leaves room for
+	// macOS's first exec of a freshly written file, which alone takes a few
+	// hundred milliseconds before the shell reaches its first line.
+	binary, runLog := cachedFakeScript(t, "/bin/sleep 30\n")
+	sidecar := currentRecord(t, binary, "2026.08.19")
+	sidecar.Size++
+	writeSidecar(t, binary, sidecar)
+	before := stateOf(t, binary)
+
+	events := make(chan ResolveEvent, 1)
+	_, err := resolveWith(t.Context(), events, 2*time.Second, 200*time.Millisecond, noFetch(t))
+
+	assertKept(t, err, binary, before)
+	assertSidecarKept(t, binary, sidecar)
+	if !strings.Contains(err.Error(), "timed out after 2s") {
+		t.Errorf("error = %q, want the probe timeout as the reason", err)
+	}
+	if n := runsLogged(t, runLog); n != 1 {
+		t.Errorf("the cached binary ran %d times, want 1", n)
+	}
+	drained(t, events)
+}
+
+func TestResolveKeepsTheCachedBinaryWhenTheOSRefusesToStartIt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows keeps no execute bit in the file mode")
+	}
+	// chmod -x with a sidecar that still matches: #16 distrusts the record
+	// because the file is not executable, the probe runs, and execve answers
+	// EACCES. That is a refusal to start, not a verdict on the file.
+	binary, runLog := cachedFake(t, "2026.09.01")
+	sidecar := currentRecord(t, binary, "2026.08.19")
+	writeSidecar(t, binary, sidecar)
+	if err := os.Chmod(binary, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := stateOf(t, binary)
+
+	events := make(chan ResolveEvent, 1)
+	_, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, noFetch(t))
+
+	assertKept(t, err, binary, before)
+	assertSidecarKept(t, binary, sidecar)
+	if !errors.Is(err, os.ErrPermission) {
+		t.Errorf("error = %v, want it to wrap the permission error", err)
+	}
+	if n := runsLogged(t, runLog); n != 0 {
+		t.Errorf("the cached binary ran %d times, want 0: it is not executable", n)
+	}
+	drained(t, events)
+}
+
+func TestResolveKeepsACachedFileWhoseInterpreterIsMissing(t *testing.T) {
+	// execve answers ENOENT for a present file whose #! interpreter (or ELF
+	// loader: a glibc build on a musl host) is absent, and the exec error then
+	// satisfies errors.Is(fs.ErrNotExist) exactly as a missing file would.
+	// "Nothing is cached" has to come from the stat, or this verified file is
+	// downloaded over on every launch and reported as not there.
+	binary, _ := cachedFake(t, "2026.09.01")
+	if err := os.WriteFile(binary, []byte("#!/nonexistent/sh\necho 2026.09.01\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before := stateOf(t, binary)
+
+	events := make(chan ResolveEvent, 1)
+	_, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, noFetch(t))
+
+	assertKept(t, err, binary, before)
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("error = %v, want the ENOENT from execve in the chain: the test no longer exercises the trap", err)
+	}
+	if _, serr := os.Stat(sidecarPath(binary)); !errors.Is(serr, fs.ErrNotExist) {
+		t.Errorf("sidecar: %v, want none written", serr)
+	}
+	drained(t, events)
+}
+
+func TestResolveReplacesACachedBinaryThatRefusesToRun(t *testing.T) {
+	// A non-zero exit is positive evidence. Resolve may download over it, and
+	// the mismatched sidecar goes first so a failed download cannot leave a
+	// record for a file it no longer describes.
+	binary, runLog := cachedFakeScript(t, "echo boom >&2\nexit 2\n")
+	sidecar := currentRecord(t, binary, "2026.08.19")
+	sidecar.Size++
+	writeSidecar(t, binary, sidecar)
+	base, hits := refusingRelease(t)
+
+	events := make(chan ResolveEvent, 1)
+	_, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, base)
+	if err == nil {
+		t.Fatal("Resolve returned no error, want the download failure")
+	}
+	var pe *probeError
+	if errors.As(err, &pe) {
+		t.Errorf("error = %v, want the download error, not the probe's", err)
+	}
+	if *hits == 0 {
+		t.Error("no request reached the release server: the download never started")
+	}
+	if n := runsLogged(t, runLog); n != 1 {
+		t.Errorf("the cached binary ran %d times, want 1", n)
+	}
+	select {
+	case ev, ok := <-events:
+		if !ok || ev != ResolveDownloading {
+			t.Errorf("event = %v, %t; want ResolveDownloading", ev, ok)
+		}
+	default:
+		t.Error("no ResolveDownloading event was sent")
+	}
+	for _, path := range []string{binary, sidecarPath(binary)} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s still present after a positive probe failure: %v", filepath.Base(path), err)
+		}
+	}
+}
+
+func TestResolveDownloadsWhenNothingIsCached(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the download stub needs the POSIX temp-dir layout the other tests use")
+	}
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("PATH", t.TempDir())
+	base, hits := refusingRelease(t)
+
+	events := make(chan ResolveEvent, 1)
+	_, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, base)
+	if err == nil {
+		t.Fatal("Resolve returned no error, want the download failure")
+	}
+	var pe *probeError
+	if errors.As(err, &pe) {
+		t.Errorf("error = %v, want the download error, not the probe's", err)
+	}
+	if *hits == 0 {
+		t.Error("no request reached the release server: the download never started")
+	}
+	select {
+	case ev, ok := <-events:
+		if !ok || ev != ResolveDownloading {
+			t.Errorf("event = %v, %t; want ResolveDownloading", ev, ok)
+		}
+	default:
+		t.Error("no ResolveDownloading event was sent")
 	}
 }
 
