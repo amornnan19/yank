@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -37,7 +38,10 @@ const (
 // Result describes a working yt-dlp executable plus what yank could find out
 // about the optional ffmpeg dependency.
 type Result struct {
-	// Path is an executable that answered --version with exit status 0.
+	// Path is an executable that answered --version with exit status 0,
+	// either during this call or during an earlier one that recorded the
+	// answer next to the file; the record is trusted only while the file's
+	// size, mtime and mode are unchanged.
 	Path string
 	// Version is the trimmed output of that --version run.
 	Version string
@@ -69,7 +73,8 @@ const (
 	// httpTimeout bounds a whole download, including the body transfer.
 	httpTimeout = 10 * time.Minute
 	// versionTimeout bounds a --version probe. The macOS build is a PyInstaller
-	// bundle that unpacks itself on first run, so this is generous.
+	// bundle that unpacks itself on every run (~10s on darwin, measured in
+	// #16), so this is generous.
 	versionTimeout = 2 * time.Minute
 	// waitDelay bounds how long a cancelled probe waits for the process's
 	// output pipes to close after it has been killed.
@@ -83,10 +88,36 @@ const (
 // errNoChecksum reports that the checksum file did not list the wanted asset.
 var errNoChecksum = errors.New("asset not listed in " + checksumsAsset)
 
-// Resolve returns a yt-dlp executable that has been proven to run, downloading
-// and verifying one into the cache directory if neither PATH nor the cache
-// already holds a working copy.
+// ResolveEvent is a milestone Resolve reports while it is still working, so a
+// UI can say what the wait is for instead of guessing from how long it has
+// taken.
+type ResolveEvent int
+
+const (
+	// ResolveDownloading reports that neither PATH nor the cache had a working
+	// copy and a download of the release has started. It starts at 1 so the
+	// zero value is never mistaken for an event.
+	ResolveDownloading ResolveEvent = iota + 1
+)
+
+// Resolve returns a yt-dlp executable that answered --version, downloading and
+// verifying one into the cache directory if neither PATH nor the cache already
+// holds a working copy. A cached copy is probed once and the answer recorded
+// beside it; later calls trust the record while the file is unchanged and do
+// not execute anything.
 func Resolve(ctx context.Context) (Result, error) {
+	return ResolveWith(ctx, nil)
+}
+
+// ResolveWith is Resolve with a channel for milestones. events may be nil.
+// A send never blocks Resolve — an event nobody is ready for is dropped, so
+// give it a buffer of one — and the channel is closed before ResolveWith
+// returns, which means it must not be shared between calls.
+func ResolveWith(ctx context.Context, events chan<- ResolveEvent) (Result, error) {
+	if events != nil {
+		defer close(events)
+	}
+
 	res := Result{}
 	res.FFmpegPath, res.HasFFmpeg = FindFFmpeg()
 
@@ -103,7 +134,23 @@ func Resolve(ctx context.Context) (Result, error) {
 	}
 	cached := filepath.Join(dir, binaryName(runtime.GOOS))
 
+	// The cached copy was checksum-verified when it was installed and answered
+	// --version then. Running it again costs a full unpack of the PyInstaller
+	// bundle (~10s on darwin, measured in #16), so while the file is the same
+	// size with the same mtime, and still executable, the recorded answer
+	// stands. The stat is taken before the probe so the record cannot describe
+	// a binary another process renamed into place while ours was running.
+	info, statErr := os.Stat(cached)
+	if statErr == nil {
+		if version, ok := recordedVersion(cached, info); ok {
+			res.Path, res.Version, res.Source = cached, version, SourceCache
+			return res, nil
+		}
+	}
 	if version, err := probeVersion(ctx, cached); err == nil {
+		if statErr == nil {
+			recordVersion(cached, info, version)
+		}
 		res.Path, res.Version, res.Source = cached, version, SourceCache
 		return res, nil
 	}
@@ -111,10 +158,17 @@ func Resolve(ctx context.Context) (Result, error) {
 		return Result{}, fmt.Errorf("could not fetch yt-dlp: %w", err)
 	}
 
+	if events != nil {
+		select {
+		case events <- ResolveDownloading:
+		default:
+		}
+	}
 	if err := download(ctx, cached); err != nil {
 		return Result{}, err
 	}
 
+	info, statErr = os.Stat(cached)
 	version, err := probeVersion(ctx, cached)
 	if err != nil {
 		if !isBadBinary(err) {
@@ -125,12 +179,104 @@ func Resolve(ctx context.Context) (Result, error) {
 		}
 		// The file itself is at fault. Remove it so the next run retries the
 		// download instead of failing the same way forever.
-		_ = os.Remove(cached)
+		discardBinary(cached)
 		return Result{}, fmt.Errorf("downloaded yt-dlp does not run: %w", err)
+	}
+	if statErr == nil {
+		recordVersion(cached, info, version)
 	}
 
 	res.Path, res.Version, res.Source = cached, version, SourceDownload
 	return res, nil
+}
+
+// versionRecord is the sidecar kept next to a cached binary: the version it
+// answered --version with, and the size and mtime it had when it did.
+type versionRecord struct {
+	Version string `json:"version"`
+	Size    int64  `json:"size"`
+	MTimeNS int64  `json:"mtime_ns"`
+}
+
+// sidecarPath is where the versionRecord for binary lives.
+func sidecarPath(binary string) string {
+	return binary + ".version"
+}
+
+// recordedVersion returns the version the sidecar next to binary recorded,
+// provided the record describes the file exactly as info reports it now. A
+// missing, unparsable or mismatched sidecar is a reason to probe, never a
+// verdict on the binary.
+//
+// The file must also still be executable. A chmod -x, or a restore that keeps
+// timestamps but drops modes, leaves size and mtime matching, and trusting the
+// record then would hand Probe a path that fails with permission denied on
+// every launch with nothing to repair it; falling through to the probe is what
+// lets the download and rename put a runnable file back. Windows keeps no
+// execute bit in the mode, so the check is skipped there.
+func recordedVersion(binary string, info os.FileInfo) (string, bool) {
+	if !info.Mode().IsRegular() {
+		return "", false
+	}
+	if runtime.GOOS != "windows" && info.Mode()&0o111 == 0 {
+		return "", false
+	}
+	body, err := os.ReadFile(sidecarPath(binary))
+	if err != nil {
+		return "", false
+	}
+	var rec versionRecord
+	if err := json.Unmarshal(body, &rec); err != nil {
+		return "", false
+	}
+	if rec.Version == "" || rec.Size != info.Size() || rec.MTimeNS != info.ModTime().UnixNano() {
+		return "", false
+	}
+	return rec.Version, true
+}
+
+// recordVersion writes the sidecar for binary, describing it as info saw it
+// before the probe that produced version. It is best effort: a sidecar that
+// could not be written costs the next run a probe, nothing more. The write
+// goes through a temp file in the same directory and a rename, so a reader
+// never sees a half-written record.
+func recordVersion(binary string, info os.FileInfo, version string) {
+	body, err := json.Marshal(versionRecord{
+		Version: version,
+		Size:    info.Size(),
+		MTimeNS: info.ModTime().UnixNano(),
+	})
+	if err != nil {
+		return
+	}
+	dest := sidecarPath(binary)
+	// The prefix matches sweepStaleTemps's glob, so a temp file abandoned here
+	// is cleaned up by the same sweep as an abandoned download.
+	tmp, err := os.CreateTemp(filepath.Dir(dest), "yt-dlp-version-*")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(body); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return
+	}
+	if err := os.Rename(tmpName, dest); err != nil {
+		os.Remove(tmpName)
+	}
+}
+
+// discardBinary removes a cached binary that a probe has positively classified
+// as unusable, and the sidecar that would otherwise describe a file that is no
+// longer there. It is the only place the cached binary is removed.
+func discardBinary(binary string) {
+	_ = os.Remove(binary)
+	_ = os.Remove(sidecarPath(binary))
 }
 
 // FindFFmpeg looks ffmpeg up on PATH. yank neither bundles nor downloads it, so

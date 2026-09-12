@@ -138,7 +138,9 @@ var ErrNoDestination = errors.New("yt-dlp did not report where it saved the file
 // Download fetches the format row names, writing it into the user's downloads
 // directory, and returns where it landed.
 //
-// ytdlpPath is an executable Resolve has already proven to run. probe is the
+// ytdlpPath is an executable Resolve has vouched for — probed this run, or
+// recorded from a prior probe of the same file with size, mtime and mode
+// unchanged. probe is the
 // extraction the row was chosen from; Download reads its InfoJSONPath and never
 // takes ownership of it — the caller still owes it exactly one Cleanup.
 //

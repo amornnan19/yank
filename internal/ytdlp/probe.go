@@ -127,8 +127,9 @@ func (e *ExtractError) Unwrap() error { return e.err }
 
 // Probe runs `yt-dlp -J` against url and returns what it said.
 //
-// ytdlpPath is an executable that Resolve has already proven to run; Probe
-// never resolves one itself. The context bounds the whole call: cancelling it
+// ytdlpPath is an executable Resolve has vouched for — probed this run, or
+// recorded from a prior probe of the same file with size, mtime and mode
+// unchanged; Probe never resolves one itself. The context bounds the whole call: cancelling it
 // kills yt-dlp, removes the temp file and returns an error wrapping
 // context.Canceled.
 func Probe(ctx context.Context, ytdlpPath, url string) (*ProbeResult, error) {

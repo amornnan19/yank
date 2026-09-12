@@ -2,6 +2,7 @@ package ytdlp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -488,6 +489,276 @@ func TestProbeVersionMissingFileIsNotBadBinary(t *testing.T) {
 	}
 }
 
+// --- the version sidecar (#16) ----------------------------------------------
+
+// cachedFake installs a fake yt-dlp in a fresh cache directory that Resolve
+// looks in, with PATH emptied so nothing else is found first. The script logs
+// every run to a file before printing version, which is how a test proves that
+// Resolve did not execute it.
+func cachedFake(t *testing.T, version string) (binary, runLog string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a POSIX shell")
+	}
+	root := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", root)
+	t.Setenv("PATH", t.TempDir())
+
+	dir, err := BinDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary = filepath.Join(dir, binaryName(runtime.GOOS))
+	runLog = filepath.Join(root, "runs.log")
+	script := fmt.Sprintf("#!/bin/sh\necho run >> '%s'\necho %s\n", runLog, version)
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return binary, runLog
+}
+
+// runsLogged counts how many times the fake installed by cachedFake ran.
+func runsLogged(t *testing.T, runLog string) int {
+	t.Helper()
+	body, err := os.ReadFile(runLog)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Count(string(body), "run\n")
+}
+
+// currentRecord is the sidecar that would describe binary as it is right now.
+func currentRecord(t *testing.T, binary, version string) versionRecord {
+	t.Helper()
+	info, err := os.Stat(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return versionRecord{Version: version, Size: info.Size(), MTimeNS: info.ModTime().UnixNano()}
+}
+
+func writeSidecar(t *testing.T, binary string, rec versionRecord) {
+	t.Helper()
+	body, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sidecarPath(binary), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readSidecar(t *testing.T, binary string) versionRecord {
+	t.Helper()
+	body, err := os.ReadFile(sidecarPath(binary))
+	if err != nil {
+		t.Fatalf("reading the sidecar: %v", err)
+	}
+	var rec versionRecord
+	if err := json.Unmarshal(body, &rec); err != nil {
+		t.Fatalf("sidecar %q does not parse: %v", body, err)
+	}
+	return rec
+}
+
+// drained asserts that Resolve closed events without sending anything, which is
+// what every path that does not download must do.
+func drained(t *testing.T, events <-chan ResolveEvent) {
+	t.Helper()
+	select {
+	case ev, ok := <-events:
+		if ok {
+			t.Fatalf("Resolve sent %v, want no event on a path that does not download", ev)
+		}
+	default:
+		t.Fatal("Resolve returned without closing the event channel")
+	}
+}
+
+func TestResolveTrustsAMatchingSidecarWithoutRunningTheBinary(t *testing.T) {
+	// The script answers with one version and the sidecar records another, so
+	// the version in the result says which of the two Resolve consulted, and
+	// the run log says whether the binary was executed at all.
+	binary, runLog := cachedFake(t, "2026.09.01")
+	writeSidecar(t, binary, currentRecord(t, binary, "2026.08.19"))
+
+	events := make(chan ResolveEvent, 1)
+	res, err := ResolveWith(t.Context(), events)
+	if err != nil {
+		t.Fatalf("ResolveWith() error = %v", err)
+	}
+	if res.Path != binary || res.Source != SourceCache {
+		t.Fatalf("result = %+v, want the cached binary from SourceCache", res)
+	}
+	if res.Version != "2026.08.19" {
+		t.Errorf("Version = %q, want the recorded %q, not the script's answer", res.Version, "2026.08.19")
+	}
+	if n := runsLogged(t, runLog); n != 0 {
+		t.Errorf("the cached binary ran %d times, want 0: the sidecar matched", n)
+	}
+	drained(t, events)
+}
+
+func TestRecordedVersionRequiresAnExecutableFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows keeps no execute bit in the file mode")
+	}
+	binary, _ := cachedFake(t, "2026.09.01")
+	rec := currentRecord(t, binary, "2026.08.19")
+	writeSidecar(t, binary, rec)
+
+	// chmod -x keeps size and mtime; the record still matches on both.
+	if err := os.Chmod(binary, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := currentRecord(t, binary, "2026.08.19"); got != rec {
+		t.Fatalf("chmod changed the record from %+v to %+v; the test no longer isolates the mode", rec, got)
+	}
+
+	if version, ok := recordedVersion(binary, info); ok {
+		t.Fatalf("recordedVersion() = %q, true; want the record distrusted once the file is not executable", version)
+	}
+}
+
+func TestResolveDoesNotTrustTheSidecarOfANonExecutableFile(t *testing.T) {
+	// The same shape through Resolve. Once the sidecar is distrusted the path
+	// is the pre-existing one — the probe fails with permission denied, which
+	// is not the file's fault, and Resolve falls through to a download. The
+	// download is a live fetch this test must not perform, so the context is
+	// cancelled up front: the probe reports the cancellation instead, and
+	// Resolve stops at the ctx.Err() check before fetching. A Resolve that
+	// trusted the sidecar would never look at the context and would answer
+	// from the record.
+	binary, _ := cachedFake(t, "2026.09.01")
+	writeSidecar(t, binary, currentRecord(t, binary, "2026.08.19"))
+	if err := os.Chmod(binary, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	res, err := Resolve(ctx)
+	if err == nil {
+		t.Fatalf("Resolve() = %+v, nil; want the sidecar distrusted and the cancelled fall-through reported", res)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want it to wrap context.Canceled", err)
+	}
+	// Distrusting the record is not a verdict on the file: nothing is removed.
+	for _, path := range []string{binary, sidecarPath(binary)} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("%s was removed: %v", filepath.Base(path), err)
+		}
+	}
+}
+
+func TestResolveReprobesWhenTheSidecarDoesNotMatch(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(rec versionRecord) versionRecord
+	}{
+		{"size differs", func(rec versionRecord) versionRecord { rec.Size++; return rec }},
+		{"mtime differs", func(rec versionRecord) versionRecord { rec.MTimeNS++; return rec }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binary, runLog := cachedFake(t, "2026.09.01")
+			writeSidecar(t, binary, tt.mutate(currentRecord(t, binary, "2026.08.19")))
+
+			res, err := Resolve(t.Context())
+			if err != nil {
+				t.Fatalf("Resolve() error = %v", err)
+			}
+			if res.Version != "2026.09.01" || res.Source != SourceCache {
+				t.Fatalf("result = %+v, want the script's own answer from SourceCache", res)
+			}
+			if n := runsLogged(t, runLog); n != 1 {
+				t.Errorf("the cached binary ran %d times, want 1: the sidecar did not match", n)
+			}
+			if got, want := readSidecar(t, binary), currentRecord(t, binary, "2026.09.01"); got != want {
+				t.Errorf("sidecar = %+v, want it rewritten to %+v", got, want)
+			}
+		})
+	}
+}
+
+func TestResolveWritesTheSidecarWhenItIsMissing(t *testing.T) {
+	binary, runLog := cachedFake(t, "2026.09.01")
+
+	res, err := Resolve(t.Context())
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if res.Version != "2026.09.01" || res.Source != SourceCache {
+		t.Fatalf("result = %+v, want the script's answer from SourceCache", res)
+	}
+	if n := runsLogged(t, runLog); n != 1 {
+		t.Fatalf("the cached binary ran %d times, want 1: there was no sidecar", n)
+	}
+	if got, want := readSidecar(t, binary), currentRecord(t, binary, "2026.09.01"); got != want {
+		t.Fatalf("sidecar = %+v, want %+v", got, want)
+	}
+
+	// The record the probe produced is what the next run answers from.
+	res, err = Resolve(t.Context())
+	if err != nil {
+		t.Fatalf("second Resolve() error = %v", err)
+	}
+	if res.Version != "2026.09.01" {
+		t.Errorf("second Version = %q, want %q", res.Version, "2026.09.01")
+	}
+	if n := runsLogged(t, runLog); n != 1 {
+		t.Errorf("the cached binary ran %d times across two resolves, want 1", n)
+	}
+}
+
+func TestResolveReprobesOnAGarbageSidecar(t *testing.T) {
+	binary, runLog := cachedFake(t, "2026.09.01")
+	if err := os.WriteFile(sidecarPath(binary), []byte("not json at all"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Resolve(t.Context())
+	if err != nil {
+		t.Fatalf("Resolve() error = %v: a bad sidecar is not a bad binary", err)
+	}
+	if res.Version != "2026.09.01" {
+		t.Errorf("Version = %q, want the script's answer %q", res.Version, "2026.09.01")
+	}
+	if n := runsLogged(t, runLog); n != 1 {
+		t.Errorf("the cached binary ran %d times, want 1", n)
+	}
+	if got, want := readSidecar(t, binary), currentRecord(t, binary, "2026.09.01"); got != want {
+		t.Errorf("sidecar = %+v, want the garbage replaced with %+v", got, want)
+	}
+}
+
+func TestDiscardBinaryRemovesTheSidecarToo(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "yt-dlp")
+	for _, path := range []string{binary, sidecarPath(binary)} {
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	discardBinary(binary)
+
+	for _, path := range []string{binary, sidecarPath(binary)} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s still present after discardBinary: %v", filepath.Base(path), err)
+		}
+	}
+}
+
 // --- stale temp file sweep (finding 3) --------------------------------------
 
 func TestSweepStaleTemps(t *testing.T) {
@@ -506,16 +777,20 @@ func TestSweepStaleTemps(t *testing.T) {
 	}
 
 	abandoned := write("yt-dlp-123456", old)
+	abandonedSidecar := write("yt-dlp-version-123456", old)
 	inFlight := write("yt-dlp-987654", time.Now())
 	installed := write("yt-dlp", old)
+	sidecar := write("yt-dlp.version", old)
 	unrelated := write("other-file", old)
 
 	sweepStaleTemps(dir, time.Hour)
 
-	if _, err := os.Stat(abandoned); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("abandoned temp file still present: %v", err)
+	for _, swept := range []string{abandoned, abandonedSidecar} {
+		if _, err := os.Stat(swept); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("abandoned temp file %s still present: %v", filepath.Base(swept), err)
+		}
 	}
-	for _, keep := range []string{inFlight, installed, unrelated} {
+	for _, keep := range []string{inFlight, installed, sidecar, unrelated} {
 		if _, err := os.Stat(keep); err != nil {
 			t.Errorf("%s was removed but should have been kept: %v", filepath.Base(keep), err)
 		}
