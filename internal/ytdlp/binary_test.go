@@ -2,9 +2,11 @@ package ytdlp
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -633,7 +636,7 @@ func TestRecordedVersionRequiresAnExecutableFile(t *testing.T) {
 		t.Fatalf("chmod changed the record from %+v to %+v; the test no longer isolates the mode", rec, got)
 	}
 
-	if version, ok := recordedVersion(binary, info); ok {
+	if version, ok := recordedVersion(readRecord(binary), info); ok {
 		t.Fatalf("recordedVersion() = %q, true; want the record distrusted once the file is not executable", version)
 	}
 }
@@ -858,7 +861,7 @@ func TestResolveKeepsTheCachedBinaryWhenTheProbeTimesOut(t *testing.T) {
 	before := stateOf(t, binary)
 
 	events := make(chan ResolveEvent, 1)
-	_, err := resolveWith(t.Context(), events, 2*time.Second, 200*time.Millisecond, noFetch(t))
+	_, err := resolveWith(t.Context(), events, 2*time.Second, 200*time.Millisecond, noFetch(t), noPython)
 
 	assertKept(t, err, binary, before)
 	assertSidecarKept(t, binary, sidecar)
@@ -887,7 +890,7 @@ func TestResolveKeepsTheCachedBinaryWhenTheOSRefusesToStartIt(t *testing.T) {
 	before := stateOf(t, binary)
 
 	events := make(chan ResolveEvent, 1)
-	_, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, noFetch(t))
+	_, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, noFetch(t), noPython)
 
 	assertKept(t, err, binary, before)
 	assertSidecarKept(t, binary, sidecar)
@@ -905,24 +908,51 @@ func TestResolveKeepsACachedFileWhoseInterpreterIsMissing(t *testing.T) {
 	// loader: a glibc build on a musl host) is absent, and the exec error then
 	// satisfies errors.Is(fs.ErrNotExist) exactly as a missing file would.
 	// "Nothing is cached" has to come from the stat, or this verified file is
-	// downloaded over on every launch and reported as not there.
-	binary, _ := cachedFake(t, "2026.09.01")
-	if err := os.WriteFile(binary, []byte("#!/nonexistent/sh\necho 2026.09.01\n"), 0o755); err != nil {
-		t.Fatal(err)
+	// downloaded over on every launch and reported as not there. The zipapp
+	// is the one exception (#19), and only when the sidecar says so; a file
+	// with no sidecar, with one from before the asset field existed, or with
+	// one naming the bundle is kept. The sidecars are stale on size so the
+	// record is distrusted and the probe actually runs.
+	tests := []struct {
+		name        string
+		withSidecar bool
+		asset       string
+	}{
+		{"no sidecar", false, ""},
+		{"sidecar names the bundle", true, assetName(runtime.GOOS, runtime.GOARCH)},
+		{"sidecar predates the asset field", true, ""},
 	}
-	before := stateOf(t, binary)
 
-	events := make(chan ResolveEvent, 1)
-	_, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, noFetch(t))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binary, _ := cachedFake(t, "2026.09.01")
+			if err := os.WriteFile(binary, []byte("#!/nonexistent/sh\necho 2026.09.01\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			var sidecar versionRecord
+			if tt.withSidecar {
+				sidecar = currentRecord(t, binary, "2026.08.19")
+				sidecar.Size++
+				sidecar.Asset = tt.asset
+				writeSidecar(t, binary, sidecar)
+			}
+			before := stateOf(t, binary)
 
-	assertKept(t, err, binary, before)
-	if !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("error = %v, want the ENOENT from execve in the chain: the test no longer exercises the trap", err)
+			events := make(chan ResolveEvent, 1)
+			_, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, noFetch(t), noPython)
+
+			assertKept(t, err, binary, before)
+			if !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("error = %v, want the ENOENT from execve in the chain: the test no longer exercises the trap", err)
+			}
+			if tt.withSidecar {
+				assertSidecarKept(t, binary, sidecar)
+			} else if _, serr := os.Stat(sidecarPath(binary)); !errors.Is(serr, fs.ErrNotExist) {
+				t.Errorf("sidecar: %v, want none written", serr)
+			}
+			drained(t, events)
+		})
 	}
-	if _, serr := os.Stat(sidecarPath(binary)); !errors.Is(serr, fs.ErrNotExist) {
-		t.Errorf("sidecar: %v, want none written", serr)
-	}
-	drained(t, events)
 }
 
 func TestResolveReplacesACachedBinaryThatRefusesToRun(t *testing.T) {
@@ -936,7 +966,7 @@ func TestResolveReplacesACachedBinaryThatRefusesToRun(t *testing.T) {
 	base, hits := refusingRelease(t)
 
 	events := make(chan ResolveEvent, 1)
-	_, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, base)
+	_, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, base, noPython)
 	if err == nil {
 		t.Fatal("Resolve returned no error, want the download failure")
 	}
@@ -974,7 +1004,7 @@ func TestResolveDownloadsWhenNothingIsCached(t *testing.T) {
 	base, hits := refusingRelease(t)
 
 	events := make(chan ResolveEvent, 1)
-	_, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, base)
+	_, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, base, noPython)
 	if err == nil {
 		t.Fatal("Resolve returned no error, want the download failure")
 	}
@@ -992,6 +1022,920 @@ func TestResolveDownloadsWhenNothingIsCached(t *testing.T) {
 		}
 	default:
 		t.Error("no ResolveDownloading event was sent")
+	}
+}
+
+// --- the zipapp release asset (#19) -----------------------------------------
+
+// noPython is a host with no python3 anywhere: the bundle's case. Its goos is
+// the runtime's so the bundle it leads to is the one fakeRelease serves for
+// this platform.
+var noPython = pythonEnv{
+	goos:        runtime.GOOS,
+	lookPath:    func(string) (string, error) { return "", exec.ErrNotFound },
+	systemDir:   "/usr/bin",
+	xcodeSelect: "/usr/bin/xcode-select",
+	timeout:     time.Minute,
+	delay:       300 * time.Millisecond,
+}
+
+// pythonHost is a host whose python3 is a fake /bin/sh script with body,
+// handed out by lookPath directly so PATH does not matter, and logging every
+// run so a test can prove it was not executed. The script's directory comes
+// back resolved, so it can stand in for env.systemDir, and it is where
+// env.xcodeSelect points, so a test that drops a fake xcode-select there with
+// fakeTool has it consulted instead of the real one.
+func pythonHost(t *testing.T, goos, body string) (env pythonEnv, dir, runLog string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a POSIX shell")
+	}
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runLog = fakeTool(t, dir, "python3", body)
+	path := filepath.Join(dir, "python3")
+	env = pythonEnv{
+		goos:        goos,
+		lookPath:    func(string) (string, error) { return path, nil },
+		systemDir:   "/usr/bin",
+		xcodeSelect: filepath.Join(dir, "xcode-select"),
+		timeout:     time.Minute,
+		delay:       300 * time.Millisecond,
+	}
+	return env, dir, runLog
+}
+
+// hasPython is a host whose python3 answers 3.12: the zipapp's case.
+func hasPython(t *testing.T) pythonEnv {
+	t.Helper()
+	env, _, _ := pythonHost(t, runtime.GOOS, "echo 'Python 3.12.1'\n")
+	return env
+}
+
+// toolDir makes a directory for fake python3 and xcode-select scripts, puts it
+// alone on PATH, and returns it with symlinks resolved, so it compares equal
+// to what usablePython resolves a path inside it to (/var is a symlink to
+// /private/var on darwin).
+func toolDir(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a POSIX shell")
+	}
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	return dir
+}
+
+// fakeTool drops an executable /bin/sh script called name in dir that logs
+// every run before doing body, and returns the log's path.
+func fakeTool(t *testing.T, dir, name, body string) (runLog string) {
+	t.Helper()
+	runLog = filepath.Join(dir, name+".log")
+	script := fmt.Sprintf("#!/bin/sh\necho run >> '%s'\n%s", runLog, body)
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return runLog
+}
+
+// testPythonEnv is a pythonEnv that looks python3 up on the PATH toolDir set,
+// runs the xcode-select in dir, and treats systemDir as the Command Line
+// Tools directory.
+func testPythonEnv(goos, dir, systemDir string) pythonEnv {
+	return pythonEnv{
+		goos:        goos,
+		lookPath:    exec.LookPath,
+		systemDir:   systemDir,
+		xcodeSelect: filepath.Join(dir, "xcode-select"),
+		timeout:     time.Minute,
+		delay:       300 * time.Millisecond,
+	}
+}
+
+func TestUsablePythonIsFalseWithoutPython3(t *testing.T) {
+	dir := toolDir(t)
+
+	if usablePython(t.Context(), testPythonEnv("linux", dir, "/usr/bin")) {
+		t.Fatal("usablePython() = true with nothing on PATH")
+	}
+}
+
+func TestUsablePythonReadsTheVersion(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"3.8 is too old", "echo 'Python 3.8.10'\n", false},
+		{"3.9 is the floor", "echo 'Python 3.9.6'\n", true},
+		{"3.12", "echo 'Python 3.12.1'\n", true},
+		{"3.10 is not 3.1", "echo 'Python 3.10.0'\n", true},
+		{"version printed on stderr", "echo 'Python 3.12.1' >&2\n", true},
+		{"python 2 answers on stderr", "echo 'Python 2.7.18' >&2\n", false},
+		{"not python at all", "echo 'Perl 5'\n", false},
+		{"refuses to run", "echo 'Python 3.12.1'\nexit 1\n", false},
+		{"prints nothing", "exit 0\n", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := toolDir(t)
+			runLog := fakeTool(t, dir, "python3", tt.body)
+
+			if got := usablePython(t.Context(), testPythonEnv("linux", dir, "/usr/bin")); got != tt.want {
+				t.Errorf("usablePython() = %t, want %t", got, tt.want)
+			}
+			if n := runsLogged(t, runLog); n != 1 {
+				t.Errorf("python3 ran %d times, want 1", n)
+			}
+		})
+	}
+}
+
+func TestUsablePythonTimeoutIsFalseNotAnError(t *testing.T) {
+	// sleep is spelled with its path because toolDir leaves only itself on
+	// PATH, and "sleep: not found" would be an exit 127, not a hang. The
+	// timeout leaves room for macOS's first exec of a freshly written file,
+	// which alone takes a few hundred milliseconds before the shell reaches
+	// its first line.
+	dir := toolDir(t)
+	runLog := fakeTool(t, dir, "python3", "/bin/sleep 30\n")
+	env := testPythonEnv("linux", dir, "/usr/bin")
+	env.timeout = 2 * time.Second
+
+	start := time.Now()
+	got := usablePython(t.Context(), env)
+	elapsed := time.Since(start)
+
+	if got {
+		t.Error("usablePython() = true for a python3 that never answered")
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("usablePython() took %s, want the timeout to have cut the run", elapsed)
+	}
+	if n := runsLogged(t, runLog); n != 1 {
+		t.Errorf("python3 ran %d times, want 1", n)
+	}
+}
+
+func TestUsablePythonChecksCommandLineToolsBeforeRunningTheSystemPython(t *testing.T) {
+	// On darwin, /usr/bin/python3 without the Command Line Tools is a stub
+	// that opens the install dialog instead of running. The fake tool dir
+	// stands in for /usr/bin, so the same script is the "system" python3 in
+	// the darwin cases and an ordinary one in the linux case.
+	tests := []struct {
+		name          string
+		goos          string
+		xcodeSelect   string
+		want          bool
+		wantXcodeRuns int
+		wantPyRuns    int
+	}{
+		{"darwin, tools missing", "darwin", "exit 1\n", false, 1, 0},
+		{"darwin, tools installed", "darwin", "echo /Library/Developer/CommandLineTools\nexit 0\n", true, 1, 1},
+		{"darwin, xcode-select hangs", "darwin", "/bin/sleep 30\n", false, 1, 0},
+		{"linux never asks", "linux", "exit 1\n", true, 0, 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := toolDir(t)
+			pyLog := fakeTool(t, dir, "python3", "echo 'Python 3.12.1'\n")
+			xcodeLog := fakeTool(t, dir, "xcode-select", tt.xcodeSelect)
+			env := testPythonEnv(tt.goos, dir, dir)
+			env.timeout = 2 * time.Second
+
+			if got := usablePython(t.Context(), env); got != tt.want {
+				t.Errorf("usablePython() = %t, want %t", got, tt.want)
+			}
+			if n := runsLogged(t, xcodeLog); n != tt.wantXcodeRuns {
+				t.Errorf("xcode-select ran %d times, want %d", n, tt.wantXcodeRuns)
+			}
+			if n := runsLogged(t, pyLog); n != tt.wantPyRuns {
+				t.Errorf("python3 ran %d times, want %d", n, tt.wantPyRuns)
+			}
+		})
+	}
+}
+
+func TestUsablePythonOutsideTheSystemDirSkipsTheToolsCheckOnDarwin(t *testing.T) {
+	// A Homebrew or pyenv python3 is not the stub; xcode-select must not be
+	// consulted for it, since a failing one would wrongly rule it out.
+	dir := toolDir(t)
+	pyLog := fakeTool(t, dir, "python3", "echo 'Python 3.12.1'\n")
+	xcodeLog := fakeTool(t, dir, "xcode-select", "exit 1\n")
+
+	if !usablePython(t.Context(), testPythonEnv("darwin", dir, "/usr/bin")) {
+		t.Error("usablePython() = false for a python3 outside the system dir")
+	}
+	if n := runsLogged(t, xcodeLog); n != 0 {
+		t.Errorf("xcode-select ran %d times, want 0", n)
+	}
+	if n := runsLogged(t, pyLog); n != 1 {
+		t.Errorf("python3 ran %d times, want 1", n)
+	}
+}
+
+func TestZipappRunnableClassifiesACutShortToolsCheck(t *testing.T) {
+	// Run under exec.CommandContext reports a context that fired mid-run as
+	// the kill it sent, an *exec.ExitError saying "signal: killed", never as
+	// context.Canceled or DeadlineExceeded. The check has to look at the
+	// contexts itself, as classifyProbe does, or a caller's cancel is not
+	// wrapped and our own timeout reads as an outside kill. This is tested
+	// at the check's own seam because resolveWith wraps ctx.Err() on its own
+	// before the error reaches the user, which would hide a regression here.
+	tests := []struct {
+		name string
+		// arrange gets the fake xcode-select's run log so a cancel can wait
+		// for the run to have started, and returns the context to use.
+		arrange func(t *testing.T, env *pythonEnv, xcodeLog string) context.Context
+		check   func(t *testing.T, err error)
+	}{
+		{"cancelled during the check", func(t *testing.T, _ *pythonEnv, xcodeLog string) context.Context {
+			ctx, cancel := context.WithCancel(t.Context())
+			go func() {
+				for t.Context().Err() == nil {
+					if _, err := os.Stat(xcodeLog); err == nil {
+						cancel()
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}()
+			return ctx
+		}, func(t *testing.T, err error) {
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("error = %v, want it to wrap context.Canceled", err)
+			}
+		}},
+		{"timed out", func(t *testing.T, env *pythonEnv, _ string) context.Context {
+			env.timeout = 2 * time.Second
+			return t.Context()
+		}, func(t *testing.T, err error) {
+			if !strings.Contains(err.Error(), "xcode-select -p timed out after 2s") {
+				t.Errorf("error = %q, want it to say xcode-select -p timed out", err)
+			}
+			if IsCancelled(err) {
+				t.Errorf("IsCancelled(%v) = true, want false: our own timeout is not the caller's cancellation", err)
+			}
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := toolDir(t)
+			pyLog := fakeTool(t, dir, "python3", "echo 'Python 3.12.1'\n")
+			xcodeLog := fakeTool(t, dir, "xcode-select", "/bin/sleep 30\n")
+			env := testPythonEnv("darwin", dir, dir)
+			ctx := tt.arrange(t, &env, xcodeLog)
+
+			runnable, err := zipappRunnable(ctx, env)
+			if err == nil {
+				t.Fatalf("zipappRunnable() = %t, <nil>, want an error: nothing was learned", runnable)
+			}
+			if runnable {
+				t.Errorf("zipappRunnable() = true alongside %v, want false", err)
+			}
+			tt.check(t, err)
+			if n := runsLogged(t, xcodeLog); n != 1 {
+				t.Errorf("xcode-select ran %d times, want 1", n)
+			}
+			if n := runsLogged(t, pyLog); n != 0 {
+				t.Errorf("python3 ran %d times, want 0", n)
+			}
+		})
+	}
+}
+
+func TestPythonIsRecent(t *testing.T) {
+	tests := []struct {
+		version string
+		want    bool
+	}{
+		{"Python 3.9.6", true},
+		{"Python 3.14.7\n", true},
+		{"Python 3.8.10", false},
+		{"Python 3.", false},
+		{"Python 3.x", false},
+		{"Python 2.7.18", false},
+		{"Python 4.0.0", false},
+		{"", false},
+		{"python 3.12.1", false},
+	}
+
+	for _, tt := range tests {
+		if got := pythonIsRecent(tt.version); got != tt.want {
+			t.Errorf("pythonIsRecent(%q) = %t, want %t", tt.version, got, tt.want)
+		}
+	}
+}
+
+func TestChooseAsset(t *testing.T) {
+	darwinPython, _, _ := pythonHost(t, "darwin", "echo 'Python 3.12.1'\n")
+	linuxPython, _, _ := pythonHost(t, "linux", "echo 'Python 3.12.1'\n")
+	freebsdPython, _, _ := pythonHost(t, "freebsd", "echo 'Python 3.12.1'\n")
+	darwinNoPython, linuxNoPython := noPython, noPython
+	darwinNoPython.goos, linuxNoPython.goos = "darwin", "linux"
+
+	tests := []struct {
+		name       string
+		goarch     string
+		env        pythonEnv
+		wantAsset  string
+		wantZipapp bool
+	}{
+		{"darwin with python", "arm64", darwinPython, zipappAsset, true},
+		{"darwin without python", "arm64", darwinNoPython, "yt-dlp_macos", false},
+		{"linux with python", "amd64", linuxPython, zipappAsset, true},
+		{"linux arm64 without python", "arm64", linuxNoPython, "yt-dlp_linux_aarch64", false},
+		{"freebsd stays on the bundle", "amd64", freebsdPython, "yt-dlp_linux", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			asset, zipapp := chooseAsset(t.Context(), tt.goarch, tt.env)
+			if asset != tt.wantAsset || zipapp != tt.wantZipapp {
+				t.Errorf("chooseAsset(%q, %q) = %q, %t; want %q, %t", tt.env.goos, tt.goarch, asset, zipapp, tt.wantAsset, tt.wantZipapp)
+			}
+		})
+	}
+}
+
+func TestChooseAssetNeverPicksTheZipappOnWindows(t *testing.T) {
+	// "python3" on Windows is the Store stub that opens a window, so the
+	// question is not even asked there.
+	env := noPython
+	env.goos = "windows"
+	env.lookPath = func(string) (string, error) {
+		t.Error("python3 was looked up on windows")
+		return "", exec.ErrNotFound
+	}
+
+	asset, zipapp := chooseAsset(t.Context(), "amd64", env)
+	if asset != "yt-dlp.exe" || zipapp {
+		t.Errorf("chooseAsset(windows) = %q, %t; want %q, false", asset, zipapp, "yt-dlp.exe")
+	}
+}
+
+func TestSidecarRecordsTheAssetAndReadsAnOldOneAsTheBundle(t *testing.T) {
+	binary, _ := cachedFake(t, "2026.09.01")
+	info, err := os.Stat(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recordVersion(binary, info, "2026.09.01", zipappAsset)
+	body, err := os.ReadFile(sidecarPath(binary))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"asset":"yt-dlp"`) {
+		t.Errorf("sidecar = %s, want it to carry the asset", body)
+	}
+	if rec := readRecord(binary); !rec.isZipapp() {
+		t.Errorf("readRecord() = %+v, want it to read back as the zipapp", rec)
+	}
+
+	// A sidecar from before #19, verbatim: no asset field at all.
+	old := fmt.Sprintf(`{"version":"2026.08.19","size":%d,"mtime_ns":%d}`, info.Size(), info.ModTime().UnixNano())
+	if err := os.WriteFile(sidecarPath(binary), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := readRecord(binary)
+	if rec.isZipapp() || rec.Asset != "" {
+		t.Errorf("readRecord() = %+v, want an old record to read as the bundle", rec)
+	}
+	if version, ok := recordedVersion(rec, info); !ok || version != "2026.08.19" {
+		t.Errorf("recordedVersion() = %q, %t; want the old record still trusted", version, ok)
+	}
+	// And the trust holds through Resolve without a run.
+	res, err := Resolve(t.Context())
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if res.Version != "2026.08.19" || res.Source != SourceCache {
+		t.Errorf("result = %+v, want the old record's version from SourceCache", res)
+	}
+}
+
+// emptyCache points Resolve at a fresh cache with nothing in it, empties PATH,
+// and returns the path a download would install to.
+func emptyCache(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake release serves POSIX shell scripts")
+	}
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("PATH", t.TempDir())
+	dir, err := BinDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(dir, binaryName(runtime.GOOS))
+}
+
+// fakeRelease serves a release whose SHA2-256SUMS lists the zipapp and every
+// unix bundle, each a /bin/sh script with the given body, and records which
+// assets were fetched, in order, so a test can see which one Resolve chose.
+// Every bundle is served so a test can pin env.goos without caring what the
+// test machine is. Anything else requested fails the test.
+func fakeRelease(t *testing.T, zipapp, bundle string) (base string, requested func() []string) {
+	t.Helper()
+	bodies := map[string]string{zipappAsset: "#!/bin/sh\n" + zipapp}
+	for _, name := range []string{"yt-dlp_macos", "yt-dlp_linux", "yt-dlp_linux_aarch64"} {
+		bodies[name] = "#!/bin/sh\n" + bundle
+	}
+	var sums strings.Builder
+	for name, body := range bodies {
+		fmt.Fprintf(&sums, "%x  %s\n", sha256.Sum256([]byte(body)), name)
+	}
+
+	var mu sync.Mutex
+	var assets []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/")
+		if name == checksumsAsset {
+			io.WriteString(w, sums.String())
+			return
+		}
+		body, ok := bodies[name]
+		if !ok {
+			t.Errorf("Resolve fetched %s, which is not a release asset", name)
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		assets = append(assets, name)
+		mu.Unlock()
+		io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL + "/", func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), assets...)
+	}
+}
+
+// downloadedOnce asserts that Resolve sent ResolveDownloading exactly once and
+// then closed events. The channel must have room for two, or a second send
+// would be dropped rather than seen.
+func downloadedOnce(t *testing.T, events <-chan ResolveEvent) {
+	t.Helper()
+	if cap(events) < 2 {
+		t.Fatal("events needs a buffer of two to see a second send")
+	}
+	ev, ok := <-events
+	if !ok || ev != ResolveDownloading {
+		t.Fatalf("event = %v, %t; want ResolveDownloading", ev, ok)
+	}
+	select {
+	case ev, ok := <-events:
+		if ok {
+			t.Fatalf("Resolve sent a second event %v, want exactly one", ev)
+		}
+	default:
+		t.Fatal("Resolve returned without closing the event channel")
+	}
+}
+
+func TestResolveInstallsTheZipappWhenPythonIsUsable(t *testing.T) {
+	// The two scripts answer different versions, so Version says which one
+	// was installed independently of the request log.
+	binary := emptyCache(t)
+	base, requested := fakeRelease(t, "echo 2026.09.01\n", "echo 2026.08.19\n")
+
+	events := make(chan ResolveEvent, 2)
+	res, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, base, hasPython(t))
+	if err != nil {
+		t.Fatalf("resolveWith() error = %v", err)
+	}
+	if res.Path != binary || res.Source != SourceDownload || res.Version != "2026.09.01" {
+		t.Errorf("result = %+v, want the zipapp's answer from SourceDownload at %s", res, binary)
+	}
+	if got := strings.Join(requested(), ","); got != zipappAsset {
+		t.Errorf("assets requested = %q, want only %q", got, zipappAsset)
+	}
+	if rec := readSidecar(t, binary); rec.Asset != zipappAsset {
+		t.Errorf("sidecar = %+v, want asset %q", rec, zipappAsset)
+	}
+	downloadedOnce(t, events)
+
+	// The next run answers from the record: nothing is fetched and no version
+	// is asked for again.
+	res, err = resolveWith(t.Context(), nil, time.Minute, 300*time.Millisecond, noFetch(t), hasPython(t))
+	if err != nil {
+		t.Fatalf("second resolveWith() error = %v", err)
+	}
+	if res.Source != SourceCache || res.Version != "2026.09.01" {
+		t.Errorf("second result = %+v, want the recorded zipapp from SourceCache", res)
+	}
+}
+
+func TestResolveInstallsTheBundleWithoutUsablePython(t *testing.T) {
+	binary := emptyCache(t)
+	base, requested := fakeRelease(t, "echo 2026.09.01\n", "echo 2026.08.19\n")
+	bundle := assetName(runtime.GOOS, runtime.GOARCH)
+
+	events := make(chan ResolveEvent, 2)
+	res, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, base, noPython)
+	if err != nil {
+		t.Fatalf("resolveWith() error = %v", err)
+	}
+	if res.Source != SourceDownload || res.Version != "2026.08.19" {
+		t.Errorf("result = %+v, want the bundle's answer from SourceDownload", res)
+	}
+	if got := strings.Join(requested(), ","); got != bundle {
+		t.Errorf("assets requested = %q, want only %q", got, bundle)
+	}
+	if rec := readSidecar(t, binary); rec.Asset != bundle {
+		t.Errorf("sidecar = %+v, want asset %q", rec, bundle)
+	}
+	downloadedOnce(t, events)
+}
+
+func TestResolveFallsBackToTheBundleWhenTheFreshZipappRefusesToRun(t *testing.T) {
+	// The zipapp downloads and verifies, then exits non-zero on its probe: a
+	// python3 that passed --version but cannot run yt-dlp. That is positive,
+	// so it is discarded and the bundle is fetched in the same Resolve, with
+	// one ResolveDownloading for the whole thing.
+	binary := emptyCache(t)
+	base, requested := fakeRelease(t, "echo boom >&2\nexit 3\n", "echo 2026.08.19\n")
+	bundle := assetName(runtime.GOOS, runtime.GOARCH)
+
+	events := make(chan ResolveEvent, 2)
+	res, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, base, hasPython(t))
+	if err != nil {
+		t.Fatalf("resolveWith() error = %v, want the bundle to have taken over", err)
+	}
+	if res.Path != binary || res.Source != SourceDownload || res.Version != "2026.08.19" {
+		t.Errorf("result = %+v, want the bundle's answer from SourceDownload", res)
+	}
+	if got, want := strings.Join(requested(), ","), zipappAsset+","+bundle; got != want {
+		t.Errorf("assets requested = %q, want %q", got, want)
+	}
+	if got, want := readSidecar(t, binary), currentRecord(t, binary, "2026.08.19"); got.Asset != bundle || got.Version != want.Version || got.Size != want.Size || got.MTimeNS != want.MTimeNS {
+		t.Errorf("sidecar = %+v, want %+v naming %q", got, want, bundle)
+	}
+	downloadedOnce(t, events)
+}
+
+func TestResolveReportsABundleThatRefusesToRunAfterTheZipappDid(t *testing.T) {
+	// Both assets fail positively: the second failure is reported the way a
+	// failing download always was, and nothing is left in the cache.
+	binary := emptyCache(t)
+	base, requested := fakeRelease(t, "exit 3\n", "exit 4\n")
+
+	events := make(chan ResolveEvent, 2)
+	_, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, base, hasPython(t))
+	if err == nil {
+		t.Fatal("resolveWith() returned no error")
+	}
+	if !isBadBinary(err) || !strings.Contains(err.Error(), "downloaded yt-dlp does not run") {
+		t.Errorf("error = %v, want the bundle's positive failure", err)
+	}
+	if got, want := strings.Join(requested(), ","), zipappAsset+","+assetName(runtime.GOOS, runtime.GOARCH); got != want {
+		t.Errorf("assets requested = %q, want %q", got, want)
+	}
+	for _, path := range []string{binary, sidecarPath(binary)} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s left behind: %v", filepath.Base(path), err)
+		}
+	}
+	downloadedOnce(t, events)
+}
+
+func TestResolveDoesNotRetryABundleThatRefusesToRun(t *testing.T) {
+	// The retry is the zipapp's alone. A bundle that fails positively is
+	// reported at once, as it always was: fetching the same asset again
+	// would only fail the same way.
+	binary := emptyCache(t)
+	base, requested := fakeRelease(t, "echo 2026.09.01\n", "exit 4\n")
+	bundle := assetName(runtime.GOOS, runtime.GOARCH)
+
+	events := make(chan ResolveEvent, 2)
+	_, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, base, noPython)
+	if err == nil {
+		t.Fatal("resolveWith() returned no error")
+	}
+	if !isBadBinary(err) || !strings.Contains(err.Error(), "downloaded yt-dlp does not run") {
+		t.Errorf("error = %v, want the bundle's positive failure", err)
+	}
+	if got := strings.Join(requested(), ","); got != bundle {
+		t.Errorf("assets requested = %q, want %q exactly once", got, bundle)
+	}
+	for _, path := range []string{binary, sidecarPath(binary)} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s left behind: %v", filepath.Base(path), err)
+		}
+	}
+	downloadedOnce(t, events)
+}
+
+func TestResolveKeepsAFreshZipappWhoseProbeIsInconclusive(t *testing.T) {
+	// A timeout on the zipapp's probe says nothing about which asset is
+	// right, so there is no second download: the file stays and the timeout
+	// is reported, as it always was.
+	binary := emptyCache(t)
+	base, requested := fakeRelease(t, "/bin/sleep 30\n", "echo 2026.08.19\n")
+
+	events := make(chan ResolveEvent, 2)
+	_, err := resolveWith(t.Context(), events, 2*time.Second, 200*time.Millisecond, base, hasPython(t))
+	if err == nil {
+		t.Fatal("resolveWith() returned no error")
+	}
+	if isBadBinary(err) || !strings.Contains(err.Error(), "timed out after 2s") {
+		t.Errorf("error = %v, want the probe timeout, inconclusive", err)
+	}
+	if got := strings.Join(requested(), ","); got != zipappAsset {
+		t.Errorf("assets requested = %q, want only %q: an inconclusive probe must not fetch the bundle", got, zipappAsset)
+	}
+	if _, err := os.Stat(binary); err != nil {
+		t.Errorf("the zipapp was removed after an inconclusive probe: %v", err)
+	}
+	downloadedOnce(t, events)
+}
+
+func TestResolveReplacesACachedZipappWhosePythonIsGoneFromPath(t *testing.T) {
+	// The zipapp's shebang is #!/usr/bin/env python3, and env is always
+	// there: a python3 gone from PATH is exit 127 from env, a positive failure
+	// isBadBinary already covers, never ENOENT from execve. The record is
+	// stale on size so the probe runs; lookPath still finds a python3 (too
+	// old to be chosen again) so the no-exec check lets the probe happen; the
+	// asset choice made afresh then picks the bundle.
+	binary, _ := cachedFake(t, "2026.09.01")
+	if err := os.WriteFile(binary, []byte("#!/usr/bin/env nonexistent_python3_xyz\necho 2026.09.01\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sidecar := currentRecord(t, binary, "2026.09.01")
+	sidecar.Size++
+	sidecar.Asset = zipappAsset
+	writeSidecar(t, binary, sidecar)
+	env, _, _ := pythonHost(t, runtime.GOOS, "echo 'Python 3.8.10'\n")
+	base, requested := fakeRelease(t, "echo 2026.09.01\n", "echo 2026.08.19\n")
+	bundle := assetName(runtime.GOOS, runtime.GOARCH)
+
+	events := make(chan ResolveEvent, 2)
+	res, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, base, env)
+	if err != nil {
+		t.Fatalf("resolveWith() error = %v, want the zipapp replaced by the bundle", err)
+	}
+	if res.Path != binary || res.Source != SourceDownload || res.Version != "2026.08.19" {
+		t.Errorf("result = %+v, want the bundle's answer from SourceDownload", res)
+	}
+	if got := strings.Join(requested(), ","); got != bundle {
+		t.Errorf("assets requested = %q, want only %q", got, bundle)
+	}
+	if rec := readSidecar(t, binary); rec.Asset != bundle || rec.Version != "2026.08.19" {
+		t.Errorf("sidecar = %+v, want the bundle recorded", rec)
+	}
+	downloadedOnce(t, events)
+}
+
+func TestResolveDiscardsATrustedZipappTheHostCanNoLongerRun(t *testing.T) {
+	// A matching record would be trusted and the zipapp handed to Probe
+	// blind. On darwin, with the Command Line Tools gone since the record was
+	// written, `env python3` reaches the /usr/bin stub and opens the install
+	// dialog on every launch, and nothing would repair it because Resolve
+	// never probes. So a record naming the zipapp is checked first, without
+	// executing the zipapp: xcode-select -p on darwin when python3 is the
+	// stub, a bare lookup on linux. When that says no, the zipapp is not run
+	// at all; it is discarded and the bundle takes its place.
+	tests := []struct {
+		name string
+		host func(t *testing.T) (env pythonEnv, pythonLog string)
+	}{
+		{"darwin, system python, tools gone", func(t *testing.T) (pythonEnv, string) {
+			env, dir, pyLog := pythonHost(t, "darwin", "echo 'Python 3.12.1'\n")
+			env.systemDir = dir
+			fakeTool(t, dir, "xcode-select", "exit 1\n")
+			return env, pyLog
+		}},
+		{"linux, no python3 on PATH", func(t *testing.T) (pythonEnv, string) {
+			env := noPython
+			env.goos = "linux"
+			return env, ""
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binary, runLog := cachedFake(t, "2026.09.01")
+			sidecar := currentRecord(t, binary, "2026.09.01")
+			sidecar.Asset = zipappAsset
+			writeSidecar(t, binary, sidecar)
+			env, pyLog := tt.host(t)
+			base, requested := fakeRelease(t, "echo 2026.09.01\n", "echo 2026.08.19\n")
+			bundle := assetName(env.goos, runtime.GOARCH)
+
+			events := make(chan ResolveEvent, 2)
+			res, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, base, env)
+			if err != nil {
+				t.Fatalf("resolveWith() error = %v, want the zipapp replaced by the bundle", err)
+			}
+			if res.Path != binary || res.Source != SourceDownload || res.Version != "2026.08.19" {
+				t.Errorf("result = %+v, want the bundle's answer from SourceDownload", res)
+			}
+			if n := runsLogged(t, runLog); n != 0 {
+				t.Errorf("the cached zipapp ran %d times, want 0: executing it is what opens the dialog", n)
+			}
+			if pyLog != "" {
+				if n := runsLogged(t, pyLog); n != 0 {
+					t.Errorf("python3 ran %d times, want 0", n)
+				}
+			}
+			if got := strings.Join(requested(), ","); got != bundle {
+				t.Errorf("assets requested = %q, want only %q", got, bundle)
+			}
+			if got, want := readSidecar(t, binary), currentRecord(t, binary, "2026.08.19"); got.Asset != bundle || got.Version != want.Version || got.Size != want.Size {
+				t.Errorf("sidecar = %+v, want the bundle recorded as %+v", got, want)
+			}
+			downloadedOnce(t, events)
+		})
+	}
+}
+
+func TestResolveDoesNotConsultPythonForABundleRecord(t *testing.T) {
+	// The no-exec check is for the zipapp alone. A record naming the bundle
+	// is trusted as before, with no lookup and no xcode-select.
+	binary, runLog := cachedFake(t, "2026.09.01")
+	sidecar := currentRecord(t, binary, "2026.08.19")
+	sidecar.Asset = assetName(runtime.GOOS, runtime.GOARCH)
+	writeSidecar(t, binary, sidecar)
+	dir := toolDir(t)
+	xcodeLog := fakeTool(t, dir, "xcode-select", "exit 1\n")
+	env := noPython
+	env.goos, env.systemDir = "darwin", dir
+	env.xcodeSelect = filepath.Join(dir, "xcode-select")
+	env.lookPath = func(string) (string, error) {
+		t.Error("python3 was looked up for a bundle record")
+		return "", exec.ErrNotFound
+	}
+
+	events := make(chan ResolveEvent, 1)
+	res, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, noFetch(t), env)
+	if err != nil {
+		t.Fatalf("resolveWith() error = %v", err)
+	}
+	if res.Source != SourceCache || res.Version != "2026.08.19" {
+		t.Errorf("result = %+v, want the recorded bundle from SourceCache", res)
+	}
+	if n := runsLogged(t, runLog); n != 0 {
+		t.Errorf("the cached binary ran %d times, want 0", n)
+	}
+	if n := runsLogged(t, xcodeLog); n != 0 {
+		t.Errorf("xcode-select ran %d times, want 0", n)
+	}
+	drained(t, events)
+}
+
+func TestResolveTrustsAZipappRecordWhenTheHostCanRunIt(t *testing.T) {
+	// The check that lets a zipapp record be trusted executes neither the
+	// zipapp nor python3: lookup only, plus xcode-select on darwin for the
+	// system python, which this fake is not, so a failing xcode-select must
+	// not be consulted and cannot rule the record out.
+	binary, runLog := cachedFake(t, "2026.09.01")
+	sidecar := currentRecord(t, binary, "2026.08.19")
+	sidecar.Asset = zipappAsset
+	writeSidecar(t, binary, sidecar)
+	env, dir, pyLog := pythonHost(t, "darwin", "echo 'Python 3.12.1'\n")
+	xcodeLog := fakeTool(t, dir, "xcode-select", "exit 1\n")
+
+	events := make(chan ResolveEvent, 1)
+	res, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, noFetch(t), env)
+	if err != nil {
+		t.Fatalf("resolveWith() error = %v", err)
+	}
+	if res.Source != SourceCache || res.Version != "2026.08.19" {
+		t.Errorf("result = %+v, want the recorded zipapp from SourceCache", res)
+	}
+	if n := runsLogged(t, runLog); n != 0 {
+		t.Errorf("the cached zipapp ran %d times, want 0", n)
+	}
+	if n := runsLogged(t, pyLog); n != 0 {
+		t.Errorf("python3 ran %d times, want 0: the record is trusted on a lookup alone", n)
+	}
+	if n := runsLogged(t, xcodeLog); n != 0 {
+		t.Errorf("xcode-select ran %d times, want 0: this python3 is not the system stub", n)
+	}
+	drained(t, events)
+}
+
+func TestResolveKeepsAZipappWhenTheToolsCheckIsInconclusive(t *testing.T) {
+	// xcode-select that hangs says nothing either way. The zipapp must not be
+	// probed (that is the exec that opens the dialog) and must not be removed
+	// (nothing positive was learned), so the run stops with the file kept.
+	binary, runLog := cachedFake(t, "2026.09.01")
+	sidecar := currentRecord(t, binary, "2026.08.19")
+	sidecar.Asset = zipappAsset
+	writeSidecar(t, binary, sidecar)
+	env, dir, pyLog := pythonHost(t, "darwin", "echo 'Python 3.12.1'\n")
+	env.systemDir = dir
+	env.timeout = 2 * time.Second
+	fakeTool(t, dir, "xcode-select", "/bin/sleep 30\n")
+	before := stateOf(t, binary)
+
+	events := make(chan ResolveEvent, 1)
+	_, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, noFetch(t), env)
+
+	assertKept(t, err, binary, before)
+	assertSidecarKept(t, binary, sidecar)
+	// The timeout is ours, so it is named as one. Run itself reports the kill
+	// as "signal: killed", which would read as an outside kill.
+	if !strings.Contains(err.Error(), "xcode-select -p timed out after 2s") {
+		t.Errorf("error = %q, want it to say xcode-select -p timed out", err)
+	}
+	if IsCancelled(err) {
+		t.Errorf("IsCancelled(%v) = true, want false: our own timeout is not the caller's cancellation", err)
+	}
+	for name, log := range map[string]string{"the cached zipapp": runLog, "python3": pyLog} {
+		if n := runsLogged(t, log); n != 0 {
+			t.Errorf("%s ran %d times, want 0", name, n)
+		}
+	}
+	drained(t, events)
+}
+
+func TestResolveReportsACancelledToolsCheckAsCancelled(t *testing.T) {
+	// A caller who cancels while xcode-select -p is the thing running gets
+	// the same answer as one who cancels during a probe: context.Canceled,
+	// wrapped, so the UI's IsCancelled route sees it. Nothing is learned
+	// about the zipapp either way, so it and its record stay. Cancelling
+	// before the check is the easy case (Start returns ctx.Err() without an
+	// exec); cancelling during it is the one that matters, because Run then
+	// reports the kill as an *exec.ExitError and only the wrap in
+	// commandLineToolsInstalled says it was a cancellation.
+	tests := []struct {
+		name string
+		// cancelled arranges for cancel to be called, given the fake
+		// xcode-select's run log so it can wait for the run to start.
+		cancelled     func(t *testing.T, cancel context.CancelFunc, xcodeLog string)
+		wantXcodeRuns int
+	}{
+		{"before the check", func(_ *testing.T, cancel context.CancelFunc, _ string) {
+			cancel()
+		}, 0},
+		{"during the check", func(t *testing.T, cancel context.CancelFunc, xcodeLog string) {
+			go func() {
+				for t.Context().Err() == nil {
+					if _, err := os.Stat(xcodeLog); err == nil {
+						cancel()
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}()
+		}, 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binary, runLog := cachedFake(t, "2026.09.01")
+			sidecar := currentRecord(t, binary, "2026.08.19")
+			sidecar.Asset = zipappAsset
+			writeSidecar(t, binary, sidecar)
+			env, dir, pyLog := pythonHost(t, "darwin", "echo 'Python 3.12.1'\n")
+			env.systemDir = dir
+			xcodeLog := fakeTool(t, dir, "xcode-select", "/bin/sleep 30\n")
+			before := stateOf(t, binary)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			tt.cancelled(t, cancel, xcodeLog)
+
+			events := make(chan ResolveEvent, 1)
+			_, err := resolveWith(ctx, events, time.Minute, 300*time.Millisecond, noFetch(t), env)
+
+			if err == nil {
+				t.Fatal("resolveWith() returned no error")
+			}
+			if !IsCancelled(err) {
+				t.Errorf("IsCancelled(%v) = false, want true", err)
+			}
+			if isBadBinary(err) {
+				t.Errorf("isBadBinary(%v) = true, want false: cancelled is not failed", err)
+			}
+			if !strings.Contains(err.Error(), "could not fetch yt-dlp") {
+				t.Errorf("error = %q, want the cancellation wording the probe path uses", err)
+			}
+			if after := stateOf(t, binary); after != before {
+				t.Errorf("cached binary changed from %+v to %+v; it must be untouched", before, after)
+			}
+			assertSidecarKept(t, binary, sidecar)
+			for name, log := range map[string]string{"the cached zipapp": runLog, "python3": pyLog} {
+				if n := runsLogged(t, log); n != 0 {
+					t.Errorf("%s ran %d times, want 0", name, n)
+				}
+			}
+			if n := runsLogged(t, xcodeLog); n != tt.wantXcodeRuns {
+				t.Errorf("xcode-select ran %d times, want %d", n, tt.wantXcodeRuns)
+			}
+			drained(t, events)
+		})
 	}
 }
 

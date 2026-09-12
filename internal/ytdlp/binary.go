@@ -73,10 +73,17 @@ const (
 
 	// httpTimeout bounds a whole download, including the body transfer.
 	httpTimeout = 10 * time.Minute
-	// versionTimeout bounds a --version probe. The macOS build is a PyInstaller
-	// bundle that unpacks itself on every run (~10s on darwin, measured in
-	// #16), so this is generous.
+	// versionTimeout bounds a --version probe. The platform bundles are
+	// PyInstaller archives that unpack themselves on every run (~10s on
+	// darwin, measured in #16), so this is generous. The zipapp does not
+	// unpack; it answers in ~0.35s (#19) and never comes near this.
 	versionTimeout = 2 * time.Minute
+	// pythonTimeout bounds each of the two short runs usablePython makes,
+	// xcode-select -p and python3 --version. Both are interpreter start and
+	// nothing else (python3 -c pass measured at 0.01s in #19); a machine that
+	// cannot manage them in this long is one where the bundle is the safer
+	// choice anyway.
+	pythonTimeout = 10 * time.Second
 	// waitDelay bounds how long a cancelled probe waits for the process's
 	// output pipes to close after it has been killed.
 	waitDelay = 2 * time.Second
@@ -115,13 +122,15 @@ func Resolve(ctx context.Context) (Result, error) {
 // give it a buffer of one — and the channel is closed before ResolveWith
 // returns, which means it must not be shared between calls.
 func ResolveWith(ctx context.Context, events chan<- ResolveEvent) (Result, error) {
-	return resolveWith(ctx, events, versionTimeout, waitDelay, releaseBase)
+	return resolveWith(ctx, events, versionTimeout, waitDelay, releaseBase, hostPython())
 }
 
-// resolveWith is ResolveWith with the probe durations and the release URL
-// injected, so tests can drive the whole cache-then-download path against a
-// fake binary and a local server without production timeouts or the network.
-func resolveWith(ctx context.Context, events chan<- ResolveEvent, timeout, delay time.Duration, base string) (Result, error) {
+// resolveWith is ResolveWith with the probe durations, the release URL and
+// the python environment injected, so tests can drive the whole
+// cache-then-download path against a fake binary and a local server without
+// production timeouts, the network, or whatever python3 the machine happens
+// to have.
+func resolveWith(ctx context.Context, events chan<- ResolveEvent, timeout, delay time.Duration, base string, env pythonEnv) (Result, error) {
 	if events != nil {
 		defer close(events)
 	}
@@ -146,85 +155,171 @@ func resolveWith(ctx context.Context, events chan<- ResolveEvent, timeout, delay
 	// --version then. Running it again costs a full unpack of the PyInstaller
 	// bundle (~10s on darwin, measured in #16), so while the file is the same
 	// size with the same mtime, and still executable, the recorded answer
-	// stands. The stat is taken before the probe so the record cannot describe
-	// a binary another process renamed into place while ours was running.
+	// stands. The zipapp would answer in well under a second (#19), but the
+	// record is trusted the same way: the rule is about the file being
+	// unchanged, not about what a probe would cost. The stat is taken before
+	// the probe so the record cannot describe a binary another process renamed
+	// into place while ours was running.
 	info, statErr := os.Stat(cached)
+	var rec versionRecord
 	if statErr == nil {
-		if version, ok := recordedVersion(cached, info); ok {
+		rec = readRecord(cached)
+	}
+	// A record that names the zipapp is checked before it is trusted and
+	// before the file is probed, and executing nothing but xcode-select -p
+	// (#19). Both trusting and probing end in an exec of the zipapp, and on
+	// darwin an exec of `env python3` with the Command Line Tools gone (a
+	// macOS major upgrade removes them) does not fail: /usr/bin/python3 is
+	// always present as a stub that opens the install dialog instead. The
+	// record's asset is read even when its size and mtime no longer match,
+	// because the question here is what the file is, not whether it changed.
+	stranded := false
+	if statErr == nil && rec.isZipapp() {
+		runnable, err := zipappRunnable(ctx, env)
+		if err != nil {
+			// Could not tell. Neither trusting the record nor removing the
+			// file is justified, and probing is the one thing that must not
+			// happen, so this run stops here with the file intact. A caller
+			// who cancelled is told that, as the probe path below does, so
+			// the UI's IsCancelled route sees it.
+			if err := ctx.Err(); err != nil {
+				return Result{}, fmt.Errorf("could not fetch yt-dlp: %w", err)
+			}
+			return Result{}, fmt.Errorf("could not use the cached yt-dlp (kept; retry, or delete it to force a fresh download): %s: %w", cached, err)
+		}
+		stranded = !runnable
+	}
+	if statErr == nil && !stranded {
+		if version, ok := recordedVersion(rec, info); ok {
 			res.Path, res.Version, res.Source = cached, version, SourceCache
 			return res, nil
 		}
 	}
-	version, probeErr := probeVersionWith(ctx, cached, timeout, delay)
-	if probeErr == nil {
-		if statErr == nil {
-			recordVersion(cached, info, version)
+	var version string
+	var probeErr error
+	if !stranded {
+		version, probeErr = probeVersionWith(ctx, cached, timeout, delay)
+		if probeErr == nil {
+			if statErr == nil {
+				// The asset is carried forward from the old record; a record
+				// without one stays without one and keeps reading as the
+				// bundle.
+				recordVersion(cached, info, version, rec.Asset)
+			}
+			res.Path, res.Version, res.Source = cached, version, SourceCache
+			return res, nil
 		}
-		res.Path, res.Version, res.Source = cached, version, SourceCache
-		return res, nil
-	}
-	if err := ctx.Err(); err != nil {
-		return Result{}, fmt.Errorf("could not fetch yt-dlp: %w", err)
+		if err := ctx.Err(); err != nil {
+			return Result{}, fmt.Errorf("could not fetch yt-dlp: %w", err)
+		}
 	}
 	// A failed probe of the cached copy is classified before anything is
-	// fetched (#18). Only two outcomes justify a download: the stat taken
-	// before the probe found nothing, or the file is positively not a working
-	// yt-dlp. A timeout, a signal we did not send, pipes cut before any
-	// output, or an OS refusal to start it say nothing about a file that was
-	// checksum-verified when it was installed, and downloading over it would
-	// be the branch the cached artifacts rule forbids.
+	// fetched (#18). Only three outcomes justify a download: the stat taken
+	// before the probe found nothing, the file is positively not a working
+	// yt-dlp, or it is a zipapp this host positively cannot run. A timeout, a
+	// signal we did not send, pipes cut before any output, or an OS refusal
+	// to start it say nothing about a file that was checksum-verified when it
+	// was installed, and downloading over it would be the branch the cached
+	// artifacts rule forbids.
 	switch {
 	case isMissing(statErr):
 		// Nothing is cached, so the download is a first run, not a
 		// replacement.
+	case stranded:
+		// A discard without a probe, and the only one. The zipapp is an
+		// optimisation over the bundle, never a requirement, and a host that
+		// cannot run python3 without a dialog positively cannot run the
+		// zipapp; no exec was needed to know that, and none was made. The
+		// asset choice below is made afresh and will pick the bundle, which
+		// is the repair. The cost is accepted: a launch whose PATH happens
+		// not to have python3 (a GUI launcher, cron) downgrades a good zipapp
+		// to the bundle permanently, because the bundle's record is trusted
+		// on every run after that.
+		discardBinary(cached)
 	case isBadBinary(probeErr):
-		// The file itself is at fault. The download's rename would replace it
-		// anyway; removing it now, with its sidecar, means a download that
-		// fails cannot leave a record describing a file it no longer matches.
+		// The file itself is at fault. That includes a zipapp whose python3
+		// has gone from PATH since the record was written: its shebang is
+		// #!/usr/bin/env python3, and env exits 127, a positive failure. The
+		// download's rename would replace it anyway; removing it now, with
+		// its sidecar, means a download that fails cannot leave a record
+		// describing a file it no longer matches.
 		discardBinary(cached)
 	default:
 		// The probe error already names the path.
 		return Result{}, fmt.Errorf("could not use the cached yt-dlp (kept; retry, or delete it to force a fresh download): %w", probeErr)
 	}
 
+	// Sent once per Resolve, whatever the download below turns into: the
+	// zipapp-then-bundle retry is one wait from the user's point of view.
 	if events != nil {
 		select {
 		case events <- ResolveDownloading:
 		default:
 		}
 	}
-	if err := downloadFrom(ctx, base, cached); err != nil {
-		return Result{}, err
+	asset, zipapp := chooseAsset(ctx, runtime.GOARCH, env)
+	version, err = installAsset(ctx, base, asset, cached, timeout, delay)
+	if err != nil && zipapp && isBadBinary(err) {
+		// The zipapp started and refused: a python3 that answered --version
+		// but cannot run yt-dlp, say. installAsset has already removed it. The
+		// bundle needs no interpreter, so it gets the one retry this Resolve
+		// makes; a positive failure of the bundle is reported as it always
+		// was. Anything inconclusive was returned above untouched, because it
+		// says nothing about which asset is right.
+		version, err = installAsset(ctx, base, assetName(runtime.GOOS, runtime.GOARCH), cached, timeout, delay)
 	}
-
-	info, statErr = os.Stat(cached)
-	version, err = probeVersionWith(ctx, cached, timeout, delay)
 	if err != nil {
-		if !isBadBinary(err) {
-			// A cancellation, a probe timeout or an OS refusal says nothing
-			// about the file, which was checksum-verified moments ago. Keep it
-			// for the next run and report the real reason.
-			return Result{}, fmt.Errorf("could not fetch yt-dlp: %w", err)
-		}
-		// The file itself is at fault. Remove it so the next run retries the
-		// download instead of failing the same way forever.
-		discardBinary(cached)
-		return Result{}, fmt.Errorf("downloaded yt-dlp does not run: %w", err)
-	}
-	if statErr == nil {
-		recordVersion(cached, info, version)
+		return Result{}, err
 	}
 
 	res.Path, res.Version, res.Source = cached, version, SourceDownload
 	return res, nil
 }
 
+// installAsset downloads the named release asset from base to dest, probes
+// it, and records the answer beside it. A positive failure of the probe
+// removes the file again, so the next attempt is a fresh download rather than
+// the same failure forever, and is returned still satisfying isBadBinary so
+// the caller can tell it from an inconclusive one. An inconclusive failure
+// keeps the file: it was checksum-verified moments ago and a cancellation, a
+// probe timeout or an OS refusal says nothing about it.
+func installAsset(ctx context.Context, base, asset, dest string, timeout, delay time.Duration) (string, error) {
+	if err := downloadFrom(ctx, base, asset, dest); err != nil {
+		return "", err
+	}
+
+	info, statErr := os.Stat(dest)
+	version, err := probeVersionWith(ctx, dest, timeout, delay)
+	if err != nil {
+		if !isBadBinary(err) {
+			return "", fmt.Errorf("could not fetch yt-dlp: %w", err)
+		}
+		discardBinary(dest)
+		return "", fmt.Errorf("downloaded yt-dlp does not run: %w", err)
+	}
+	if statErr == nil {
+		recordVersion(dest, info, version, asset)
+	}
+	return version, nil
+}
+
 // versionRecord is the sidecar kept next to a cached binary: the version it
-// answered --version with, and the size and mtime it had when it did.
+// answered --version with, the size and mtime it had when it did, and which
+// release asset it is. Asset is absent from sidecars written before the
+// zipapp existed (#19); those files are the platform bundle, and an empty
+// Asset reads that way everywhere.
 type versionRecord struct {
 	Version string `json:"version"`
 	Size    int64  `json:"size"`
 	MTimeNS int64  `json:"mtime_ns"`
+	Asset   string `json:"asset,omitempty"`
+}
+
+// isZipapp reports whether the record says the file is the zipapp release
+// asset, the one build that needs a python3 on the machine to run. The
+// bundle, and a record with no asset at all, are not.
+func (rec versionRecord) isZipapp() bool {
+	return rec.Asset == zipappAsset
 }
 
 // sidecarPath is where the versionRecord for binary lives.
@@ -232,10 +327,24 @@ func sidecarPath(binary string) string {
 	return binary + ".version"
 }
 
-// recordedVersion returns the version the sidecar next to binary recorded,
-// provided the record describes the file exactly as info reports it now. A
-// missing, unparsable or mismatched sidecar is a reason to probe, never a
-// verdict on the binary.
+// readRecord parses the sidecar next to binary. A missing or unparsable
+// sidecar reads as the zero record, which matches no file and names no
+// asset; that is a reason to probe, never a verdict on the binary.
+func readRecord(binary string) versionRecord {
+	body, err := os.ReadFile(sidecarPath(binary))
+	if err != nil {
+		return versionRecord{}
+	}
+	var rec versionRecord
+	if err := json.Unmarshal(body, &rec); err != nil {
+		return versionRecord{}
+	}
+	return rec
+}
+
+// recordedVersion returns the version rec recorded, provided it describes the
+// file exactly as info reports it now. A mismatched record is a reason to
+// probe, never a verdict on the binary.
 //
 // The file must also still be executable. A chmod -x, or a restore that keeps
 // timestamps but drops modes, leaves size and mtime matching, and trusting the
@@ -243,19 +352,11 @@ func sidecarPath(binary string) string {
 // every launch with nothing to repair it; falling through to the probe is what
 // lets the download and rename put a runnable file back. Windows keeps no
 // execute bit in the mode, so the check is skipped there.
-func recordedVersion(binary string, info os.FileInfo) (string, bool) {
+func recordedVersion(rec versionRecord, info os.FileInfo) (string, bool) {
 	if !info.Mode().IsRegular() {
 		return "", false
 	}
 	if runtime.GOOS != "windows" && info.Mode()&0o111 == 0 {
-		return "", false
-	}
-	body, err := os.ReadFile(sidecarPath(binary))
-	if err != nil {
-		return "", false
-	}
-	var rec versionRecord
-	if err := json.Unmarshal(body, &rec); err != nil {
 		return "", false
 	}
 	if rec.Version == "" || rec.Size != info.Size() || rec.MTimeNS != info.ModTime().UnixNano() {
@@ -265,15 +366,17 @@ func recordedVersion(binary string, info os.FileInfo) (string, bool) {
 }
 
 // recordVersion writes the sidecar for binary, describing it as info saw it
-// before the probe that produced version. It is best effort: a sidecar that
-// could not be written costs the next run a probe, nothing more. The write
-// goes through a temp file in the same directory and a rename, so a reader
-// never sees a half-written record.
-func recordVersion(binary string, info os.FileInfo, version string) {
+// before the probe that produced version, and naming the release asset it is
+// (empty when that is not known, which reads as the bundle). It is best
+// effort: a sidecar that could not be written costs the next run a probe,
+// nothing more. The write goes through a temp file in the same directory and
+// a rename, so a reader never sees a half-written record.
+func recordVersion(binary string, info os.FileInfo, version, asset string) {
 	body, err := json.Marshal(versionRecord{
 		Version: version,
 		Size:    info.Size(),
 		MTimeNS: info.ModTime().UnixNano(),
+		Asset:   asset,
 	})
 	if err != nil {
 		return
@@ -354,7 +457,16 @@ func binaryName(goos string) string {
 	return "yt-dlp"
 }
 
-// assetName maps a platform onto the matching yt-dlp release asset.
+// zipappAsset is the release asset that is yt-dlp as a Python zipapp: a
+// #!/usr/bin/env python3 shebang on a zip of the sources, ~3 MB. It needs a
+// python3 on the machine, and in return it starts in ~0.35s where the
+// PyInstaller bundles spend ~10s unpacking themselves (#19).
+const zipappAsset = "yt-dlp"
+
+// assetName maps a platform onto its yt-dlp release bundle: the PyInstaller
+// build that carries its own interpreter and runs on a machine with no
+// python3 at all. It is what download installs unless chooseAsset finds a
+// python3 the zipapp can use, and the only choice on Windows.
 func assetName(goos, goarch string) string {
 	switch {
 	case goos == "darwin":
@@ -366,6 +478,180 @@ func assetName(goos, goarch string) string {
 	default:
 		return "yt-dlp_linux"
 	}
+}
+
+// chooseAsset picks the release asset a download installs. On darwin and
+// linux, when usablePython finds a python3 the zipapp can run on, that is the
+// zipapp; everywhere else, and always on Windows, where "python3" on PATH is
+// the Store stub that opens a window, it is the platform bundle. zipapp
+// reports which was chosen, because a zipapp that then fails positively has
+// a fallback and a bundle does not.
+func chooseAsset(ctx context.Context, goarch string, env pythonEnv) (asset string, zipapp bool) {
+	if (env.goos == "darwin" || env.goos == "linux") && usablePython(ctx, env) {
+		return zipappAsset, true
+	}
+	return assetName(env.goos, goarch), false
+}
+
+// minPythonMinor is the oldest Python 3 the zipapp may be run with.
+const minPythonMinor = 9
+
+// pythonEnv is what the python checks consult. hostPython fills it from the
+// running system; tests substitute the pieces so the checks can be exercised
+// against fake interpreters without depending on the machine, and so a
+// Resolve test decides the asset choice instead of the machine.
+type pythonEnv struct {
+	goos string
+	// lookPath finds python3; exec.LookPath in production.
+	lookPath func(file string) (string, error)
+	// systemDir is the directory whose python3 is Apple's Command Line Tools
+	// stub, /usr/bin in production. A python3 that resolves into it is run
+	// only after xcode-select -p confirms the tools are installed: without
+	// them the stub opens the install dialog instead of failing.
+	systemDir string
+	// xcodeSelect is the xcode-select executable, /usr/bin/xcode-select in
+	// production. It is spelled out rather than looked up because the check
+	// runs on launches whose PATH may not have /usr/bin on it (a GUI launcher,
+	// cron), and a lookup failing there would make the check inconclusive
+	// on every run.
+	xcodeSelect string
+	timeout     time.Duration
+	delay       time.Duration
+}
+
+// hostPython is the pythonEnv of the machine yank is running on.
+func hostPython() pythonEnv {
+	return pythonEnv{
+		goos:        runtime.GOOS,
+		lookPath:    exec.LookPath,
+		systemDir:   "/usr/bin",
+		xcodeSelect: "/usr/bin/xcode-select",
+		timeout:     pythonTimeout,
+		delay:       waitDelay,
+	}
+}
+
+// usablePython reports whether env has a python3 the zipapp can be run with.
+// The rule (#19): python3 is on PATH; on darwin, if it resolves into
+// env.systemDir, xcode-select -p exits 0 first; and python3 --version reports
+// 3.9 or newer. No other interpreter is looked for and PATH is not touched. A
+// false answer is "not this run", never an error: every failure, positive or
+// inconclusive, means the bundle, which needs no interpreter and so is always
+// the safe choice.
+func usablePython(ctx context.Context, env pythonEnv) bool {
+	path, ok, err := pythonOnPath(ctx, env)
+	if err != nil || !ok {
+		return false
+	}
+	// Older pythons print their version to stderr, so both streams are read.
+	// classifyProbe applies the positive/inconclusive discipline; here both
+	// outcomes end the same way, but a run that produced the version and was
+	// then cut by WaitDelay still counts, and a cancelled one still does not.
+	version, err := versionOutput(ctx, path, env.timeout, env.delay, true)
+	if err != nil {
+		return false
+	}
+	return pythonIsRecent(version)
+}
+
+// zipappRunnable reports whether a cached zipapp may be executed on this host
+// at all, without executing it: python3 is on PATH, and on darwin, when it is
+// the Command Line Tools stub, the tools are installed, so `env python3` runs
+// an interpreter rather than opening a dialog. It is usablePython without the
+// version check, because the record says the zipapp already ran here once and
+// the probe that follows a distrusted record will say if that has changed.
+// err reports that the question could not be answered this run (xcode-select
+// was cancelled, timed out or would not start); the caller must then neither
+// trust the record nor remove the file.
+func zipappRunnable(ctx context.Context, env pythonEnv) (bool, error) {
+	_, ok, err := pythonOnPath(ctx, env)
+	return ok, err
+}
+
+// pythonOnPath finds python3 and, on darwin when it resolves into
+// env.systemDir, confirms the Command Line Tools are installed before anyone
+// runs it. Nothing but xcode-select -p is executed. ok is false when python3
+// must not be run here; err is set when that could not be determined.
+func pythonOnPath(ctx context.Context, env pythonEnv) (path string, ok bool, err error) {
+	path, err = env.lookPath("python3")
+	if err != nil {
+		return "", false, nil
+	}
+	if env.goos != "darwin" {
+		return path, true, nil
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		// LookPath just found it; a path that cannot be resolved a moment
+		// later is not a verdict on anything.
+		return "", false, fmt.Errorf("resolving %s: %w", path, err)
+	}
+	// A pyenv/asdf/mise shim is a script that EvalSymlinks does not see
+	// through; a user whose shim ends at the stub gets the same dialog from
+	// their own shell, so that is accepted.
+	if !strings.HasPrefix(resolved, env.systemDir+string(filepath.Separator)) {
+		return path, true, nil
+	}
+	installed, err := commandLineToolsInstalled(ctx, env)
+	if err != nil {
+		return "", false, err
+	}
+	return path, installed, nil
+}
+
+// commandLineToolsInstalled runs xcode-select -p, which exits 0 only when a
+// developer directory is selected and never opens anything itself. It is what
+// stands between yank and a GUI dialog: /usr/bin/python3 without the Command
+// Line Tools is a stub that offers to install them instead of running. The
+// answer is classified like every other run: a non-zero exit is the positive
+// no; a cancellation, our own timeout, a signal kill or a failure to start
+// says nothing and comes back as err.
+func commandLineToolsInstalled(ctx context.Context, env pythonEnv) (bool, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, env.timeout)
+	defer cancel()
+	cmd := exec.CommandContext(probeCtx, env.xcodeSelect, "-p")
+	cmd.WaitDelay = env.delay
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	// The contexts are consulted before the error is, as classifyProbe does:
+	// when either fires mid-run, Run reports the kill as an *exec.ExitError
+	// ("signal: killed"), never as context.Canceled or DeadlineExceeded, so
+	// the caller's IsCancelled would be false and a timeout would read as a
+	// kill unless the context error is wrapped here.
+	if ctx.Err() != nil {
+		return false, fmt.Errorf("xcode-select -p: %w", ctx.Err())
+	}
+	if probeCtx.Err() != nil {
+		return false, fmt.Errorf("xcode-select -p timed out after %s", env.timeout)
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() >= 0 {
+		return false, nil
+	}
+	return false, fmt.Errorf("xcode-select -p: %w", err)
+}
+
+// pythonIsRecent reports whether a python --version answer names a Python 3
+// of at least minPythonMinor. The zipapp is a Python 3 program, so only a
+// major of 3 is looked at; anything that does not read as "Python 3.N" is
+// not usable, whatever it is.
+func pythonIsRecent(version string) bool {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(version), "Python 3.")
+	if !ok {
+		return false
+	}
+	minor := 0
+	digits := 0
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			break
+		}
+		minor = minor*10 + int(r-'0')
+		digits++
+	}
+	return digits > 0 && minor >= minPythonMinor
 }
 
 // probeError reports why a --version probe produced no version.
@@ -409,6 +695,14 @@ func probeVersion(ctx context.Context, path string) (string, error) {
 // probeVersionWith is probeVersion with the two durations injected, so tests
 // can exercise the real exec path without waiting on production timeouts.
 func probeVersionWith(ctx context.Context, path string, timeout, delay time.Duration) (string, error) {
+	return versionOutput(ctx, path, timeout, delay, false)
+}
+
+// versionOutput runs path --version and hands the outcome to classifyProbe.
+// mergeStderr folds stderr into the answer, for programs that print their
+// version there; yt-dlp does not, and a stray warning on stderr must not
+// become part of its version.
+func versionOutput(ctx context.Context, path string, timeout, delay time.Duration, mergeStderr bool) (string, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -421,8 +715,13 @@ func probeVersionWith(ctx context.Context, path string, timeout, delay time.Dura
 	// out rather than blaming the file.
 	cmd.WaitDelay = delay
 
-	out, err := cmd.Output()
-	return classifyProbe(path, out, err, ctx.Err(), probeCtx.Err(), timeout)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if mergeStderr {
+		cmd.Stderr = &out
+	}
+	err := cmd.Run()
+	return classifyProbe(path, out.Bytes(), err, ctx.Err(), probeCtx.Err(), timeout)
 }
 
 // classifyProbe turns the outcome of a --version run into either a version or
@@ -484,15 +783,14 @@ func classifyProbe(path string, out []byte, runErr, callerCtxErr, probeCtxErr er
 	return "", &probeError{fmt.Errorf("%s --version failed: %w", path, runErr), false}
 }
 
-// downloadFrom fetches the release asset for this platform from base, checks
-// it against the release's SHA2-256SUMS, and atomically moves it to dest. The
-// download lands in a unique temp file inside dest's directory first, so an
+// downloadFrom fetches the named release asset from base, checks it against
+// the release's SHA2-256SUMS, and atomically moves it to dest. The download
+// lands in a unique temp file inside dest's directory first, so an
 // interrupted run cannot leave a half-written file at dest and two yank
 // processes racing on first run cannot write to the same path. base is
 // releaseBase in production; tests point it at a local server.
-func downloadFrom(ctx context.Context, base, dest string) error {
+func downloadFrom(ctx context.Context, base, asset, dest string) error {
 	client := &http.Client{Timeout: httpTimeout}
-	asset := assetName(runtime.GOOS, runtime.GOARCH)
 
 	sums, err := fetch(ctx, client, base+checksumsAsset, maxChecksumsBytes)
 	if err != nil {

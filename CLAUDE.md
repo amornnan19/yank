@@ -25,10 +25,21 @@ error must separate a *positive* failure — the process ran and refused — fro
 *inconclusive* one: the caller cancelled, our own timeout fired, a signal we did
 not send killed it (`ExitCode() < 0`), or `exec.ErrWaitDelay` cut the pipes. Only
 a positive failure may be reported as the URL's or the file's fault.
-`classifyProbe` in `binary.go` is the reference. `ENOENT` from `execve` is not
+`classifyProbe` in `binary.go` is the reference. `cmd.Run` under
+`exec.CommandContext` returns the kill signal as an `*exec.ExitError`, never
+`context.Canceled` or `DeadlineExceeded`; a helper that runs a child must wrap
+`ctx.Err()` or its own timeout error itself on those branches, as
+`classifyProbe` does, or `IsCancelled` is false for a cancel and a timeout
+reads as "signal: killed". `ENOENT` from `execve` is not
 proof a file is missing: a present file with an absent interpreter or ELF
 loader fails the same way. Decide "nothing is cached" from the `os.Stat` taken
-before the probe, never from the exec error alone.
+before the probe, never from the exec error alone. The zipapp's shebang is
+`#!/usr/bin/env python3`, and `/usr/bin/env` is always present: a missing
+python3 therefore surfaces as exit 127 from `env`, a positive failure, never as
+`ENOENT` from `execve`. On darwin `/usr/bin/python3` always exists as the
+Command Line Tools stub, so `exec.LookPath("python3")` succeeding proves nothing
+there; the check that matters is `xcode-select -p`, and it must run before
+anything execs a zipapp, because the stub opens a GUI dialog instead of failing.
 
 **Exit codes are classified positively too.** `tea.ErrProgramKilled` is not proof
 of a clean shutdown: `Program.Run` wraps *every* error the event loop produced in
