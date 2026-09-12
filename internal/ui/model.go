@@ -69,9 +69,14 @@ type Model struct {
 	bin    ytdlp.Result
 	hasBin bool
 
-	url      string
-	step     probeStep
-	firstRun bool
+	url  string
+	step probeStep
+	// firstRun is set only by Resolve reporting that it has started a
+	// download. It is knowledge, not a guess from elapsed time: the cached
+	// binary alone takes ~10s to answer on darwin (measured in #16), so any
+	// timer short enough to be useful fires on every run.
+	firstRun  bool
+	resolveCh chan ytdlp.ResolveEvent
 
 	// startURL is a URL that came from the command line. It is submitted once,
 	// from Init, and then never read again: reset builds its fresh model with
@@ -199,11 +204,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m.submit()
 
-	case firstRunNoticeMsg:
-		if msg.seq == m.seq && m.state == stateProbing && m.step == stepResolving {
+	case resolveEventMsg:
+		// Resolve has closed the channel, or this event belongs to an attempt
+		// that is over: nothing to change and nothing to reschedule.
+		if msg.closed || msg.seq != m.seq || m.state != stateProbing || m.step != stepResolving {
+			return m, nil
+		}
+		if msg.ev == ytdlp.ResolveDownloading {
 			m.firstRun = true
 		}
-		return m, nil
+		return m, waitResolveEvent(m.resolveCh, msg.seq)
 
 	case resolvedMsg:
 		return m.handleResolved(msg)
@@ -351,7 +361,14 @@ func (m Model) submit() (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.spin.Tick, probeCmd(m.runCtx, m.deps, m.seq, m.bin.Path, m.url, false))
 	}
 	m.step = stepResolving
-	return m, tea.Batch(m.spin.Tick, resolveCmd(m.runCtx, m.deps, m.seq), firstRunNoticeCmd(m.seq))
+	// Buffered by one so Resolve's send never waits on the drain; the drain
+	// still sees the event because the channel is closed, not dropped, after it.
+	m.resolveCh = make(chan ytdlp.ResolveEvent, 1)
+	return m, tea.Batch(
+		m.spin.Tick,
+		resolveCmd(m.runCtx, m.deps, m.seq, m.resolveCh),
+		waitResolveEvent(m.resolveCh, m.seq),
+	)
 }
 
 // startAttempt abandons whatever was in flight and opens a new generation.
@@ -401,6 +418,7 @@ func (m Model) backToInput() Model {
 	m.rows, m.cursor = nil, 0
 	m.prog, m.hasProg = ytdlp.Progress{}, false
 	m.progCh = nil
+	m.resolveCh = nil
 	m.retrying = false
 	m.errMsg = ""
 	m.result = nil
@@ -527,6 +545,7 @@ func (m Model) handleResolved(msg resolvedMsg) (tea.Model, tea.Cmd) {
 	m.bin, m.hasBin = msg.res, true
 	m.step = stepFetchingInfo
 	m.firstRun = false
+	m.resolveCh = nil
 	// A second run on the same attempt, so it is counted here rather than in
 	// startAttempt: resolving and probing are two runs behind one spinner.
 	m.pending++

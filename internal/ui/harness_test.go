@@ -39,6 +39,9 @@ type fakes struct {
 	resolveCalls int
 	resolveRes   ytdlp.Result
 	resolveErr   error
+	// resolveDownloading makes the fake report a download before answering,
+	// the way the real Resolve does when neither PATH nor the cache had a copy.
+	resolveDownloading bool
 
 	probeCalls int
 	probeURLs  []string
@@ -57,10 +60,22 @@ type fakes struct {
 
 func (f *fakes) deps() Deps {
 	return Deps{
-		Resolve: func(ctx context.Context) (ytdlp.Result, error) {
+		Resolve: func(ctx context.Context, events chan<- ytdlp.ResolveEvent) (ytdlp.Result, error) {
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			f.resolveCalls++
+			// The real Resolve sends without blocking and closes the channel
+			// before returning; the fake keeps both halves of the contract so
+			// the drain sees exactly what production would show it.
+			if events != nil {
+				if f.resolveDownloading {
+					select {
+					case events <- ytdlp.ResolveDownloading:
+					default:
+					}
+				}
+				close(events)
+			}
 			return f.resolveRes, f.resolveErr
 		},
 		Probe: func(ctx context.Context, ytdlpPath, url string) (*ytdlp.ProbeResult, error) {
@@ -214,10 +229,9 @@ const collectWindow = 2 * time.Second
 // collect runs cmd, expanding tea.Batch, and returns the messages that arrived
 // within collectWindow.
 //
-// Commands that are meant to block — the first-run notice timer, a drain
-// waiting on a channel nothing has written to — simply do not appear in the
-// result. Each test says which messages it expects rather than asserting on the
-// whole set.
+// Commands that are meant to block — the quit deadline, a drain waiting on a
+// channel nothing has written to — simply do not appear in the result. Each
+// test says which messages it expects rather than asserting on the whole set.
 func collect(t *testing.T, cmd tea.Cmd) []tea.Msg {
 	t.Helper()
 	if cmd == nil {

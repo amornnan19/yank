@@ -62,8 +62,11 @@ func (m Model) probingView() string {
 }
 
 // statusLine says what the spinner is waiting for. Resolving gets two wordings:
-// the first run has to download and unpack a release, and a spinner with no
-// explanation in front of a 40 MB download reads as a hang.
+// "checking" covers PATH and the cache, which on darwin can itself be a ~10s
+// unpack (measured in #16), and "first run" is shown only once Resolve has
+// reported that it is downloading a release — a spinner with no explanation in
+// front of a 40 MB download reads as a hang, and the same words in front of a
+// cache hit are a lie. The switch is knowledge from Resolve, never a timer.
 func (m Model) statusLine() string {
 	switch {
 	case m.step == stepResolving && m.firstRun:

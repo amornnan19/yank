@@ -20,8 +20,10 @@ import (
 // Each field has the signature of the ytdlp function it stands for, so wiring
 // one to the wrong package function does not compile.
 type Deps struct {
-	// Resolve produces a yt-dlp executable, downloading one on first run.
-	Resolve func(ctx context.Context) (ytdlp.Result, error)
+	// Resolve produces a yt-dlp executable, downloading one on first run. It
+	// reports the start of that download on events, which may be nil, and
+	// closes the channel before returning.
+	Resolve func(ctx context.Context, events chan<- ytdlp.ResolveEvent) (ytdlp.Result, error)
 
 	// Probe extracts one URL into a ProbeResult the caller then owns.
 	Probe func(ctx context.Context, ytdlpPath, url string) (*ytdlp.ProbeResult, error)
@@ -42,7 +44,7 @@ type Deps struct {
 // Production is Deps wired to the real internal/ytdlp functions.
 func Production() Deps {
 	return Deps{
-		Resolve:  ytdlp.Resolve,
+		Resolve:  ytdlp.ResolveWith,
 		Probe:    ytdlp.Probe,
 		Rank:     ytdlp.Rank,
 		Download: ytdlp.Download,

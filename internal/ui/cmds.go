@@ -55,11 +55,14 @@ type downloadDoneMsg struct {
 	err error
 }
 
-// firstRunNoticeMsg fires once the binary step has taken long enough that it is
-// worth saying why. See Model.statusLine for what it changes and why the delay
-// is the signal.
-type firstRunNoticeMsg struct {
-	seq int
+// resolveEventMsg is one milestone from a running Resolve. closed reports that
+// Resolve closed the channel, which it always does before returning; it is what
+// stops the drain rescheduling itself. See Model.statusLine for what the event
+// changes.
+type resolveEventMsg struct {
+	seq    int
+	ev     ytdlp.ResolveEvent
+	closed bool
 }
 
 // startURLMsg carries no data: it is the command line's URL being submitted,
@@ -91,19 +94,9 @@ type quitTimeoutMsg struct{}
 // always have left, so the deadline is never worse than not waiting.
 const quitGrace = 2 * time.Second
 
-// firstRunNoticeDelay is how long resolving may take before the status line
-// starts explaining itself.
-//
-// Resolve answers from PATH or the cache with one --version run, which is fast
-// even for the self-unpacking macOS build. Past this, it is either downloading
-// the release or unpacking it for the first time — both of which are "first
-// run", and both of which are worth naming rather than leaving the user in
-// front of a bare spinner.
-const firstRunNoticeDelay = 1500 * time.Millisecond
-
-func resolveCmd(ctx context.Context, deps Deps, seq int) tea.Cmd {
+func resolveCmd(ctx context.Context, deps Deps, seq int, events chan<- ytdlp.ResolveEvent) tea.Cmd {
 	return func() tea.Msg {
-		res, err := deps.Resolve(ctx)
+		res, err := deps.Resolve(ctx, events)
 		return resolvedMsg{seq: seq, res: res, err: err}
 	}
 }
@@ -136,13 +129,19 @@ func waitProgress(ch <-chan ytdlp.Progress, seq int) tea.Cmd {
 	}
 }
 
+// waitResolveEvent is waitProgress for Resolve: one event off the channel, and
+// the handler reschedules it until the closed message arrives.
+func waitResolveEvent(ch <-chan ytdlp.ResolveEvent, seq int) tea.Cmd {
+	return func() tea.Msg {
+		ev, ok := <-ch
+		if !ok {
+			return resolveEventMsg{seq: seq, closed: true}
+		}
+		return resolveEventMsg{seq: seq, ev: ev}
+	}
+}
+
 // quitDeadlineCmd bounds the wait in updateQuitting.
 func quitDeadlineCmd() tea.Cmd {
 	return tea.Tick(quitGrace, func(time.Time) tea.Msg { return quitTimeoutMsg{} })
-}
-
-func firstRunNoticeCmd(seq int) tea.Cmd {
-	return tea.Tick(firstRunNoticeDelay, func(time.Time) tea.Msg {
-		return firstRunNoticeMsg{seq: seq}
-	})
 }

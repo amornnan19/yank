@@ -168,23 +168,78 @@ func TestSecondURLSkipsResolving(t *testing.T) {
 	}
 }
 
-func TestFirstRunNotice(t *testing.T) {
+func TestStatusStaysCheckingWhenResolveDoesNotDownload(t *testing.T) {
+	// Issue #16: the notice used to come from a timer, and on darwin the cached
+	// binary alone takes longer than the timer did, so every run said "first
+	// run". A Resolve that never reports a download must leave the wording at
+	// "checking" however long it takes.
 	f := &fakes{}
 	m := testModel(t, f, 80)
 	m = typeURL(m, "https://example.com/v")
-	m = send(m, keyOf(tea.KeyEnter))
+	m, cmd := step(m, keyOf(tea.KeyEnter))
 
-	if strings.Contains(m.View(), "first run") {
-		t.Fatalf("the first-run notice is showing before the delay:\n%s", m.View())
+	if !strings.Contains(m.View(), "checking yt-dlp…") {
+		t.Fatalf("probing screen does not say it is checking:\n%s", m.View())
 	}
 
-	m = send(m, firstRunNoticeMsg{seq: m.seq})
-	if !strings.Contains(m.View(), "first run: fetching yt-dlp") {
-		t.Fatalf("the first-run notice never appeared:\n%s", m.View())
+	// The fake answers without downloading, so the drain sees only the close.
+	ev, ok := findMsg[resolveEventMsg](collect(t, cmd))
+	if !ok {
+		t.Fatal("submitting did not start the resolve-event drain")
+	}
+	if !ev.closed {
+		t.Fatalf("drain produced %+v, want the closed message: nothing was downloaded", ev)
+	}
+	m, cmd = step(m, ev)
+	if m.firstRun || strings.Contains(m.View(), "first run") {
+		t.Fatalf("the first-run notice appeared without a download:\n%s", m.View())
+	}
+	if !strings.Contains(m.View(), "checking yt-dlp…") {
+		t.Fatalf("the close changed the status line:\n%s", m.View())
+	}
+	if cmd != nil {
+		t.Fatal("the drain was rescheduled after the channel closed; it would spin on a closed channel")
 	}
 }
 
-func TestFirstRunNoticeFromAnAbandonedAttemptIsIgnored(t *testing.T) {
+func TestFirstRunNoticeFollowsTheDownloadEvent(t *testing.T) {
+	f := &fakes{resolveDownloading: true}
+	m := testModel(t, f, 80)
+	m = typeURL(m, "https://example.com/v")
+	m, cmd := step(m, keyOf(tea.KeyEnter))
+
+	if strings.Contains(m.View(), "first run") {
+		t.Fatalf("the first-run notice is showing before Resolve said anything:\n%s", m.View())
+	}
+
+	ev, ok := findMsg[resolveEventMsg](collect(t, cmd))
+	if !ok {
+		t.Fatal("submitting did not start the resolve-event drain")
+	}
+	if ev.closed || ev.ev != ytdlp.ResolveDownloading {
+		t.Fatalf("drain produced %+v, want ResolveDownloading", ev)
+	}
+	m, cmd = step(m, ev)
+	if !strings.Contains(m.View(), "first run: fetching yt-dlp…") {
+		t.Fatalf("the first-run notice did not follow the download event:\n%s", m.View())
+	}
+
+	// The handler reschedules the drain, which now sees the close. The close
+	// carries no information about the download and must not undo the notice.
+	closed, ok := findMsg[resolveEventMsg](collect(t, cmd))
+	if !ok || !closed.closed {
+		t.Fatalf("after the event the drain produced %+v, %v; want the closed message", closed, ok)
+	}
+	m, cmd = step(m, closed)
+	if !strings.Contains(m.View(), "first run: fetching yt-dlp…") {
+		t.Fatalf("the close undid the notice:\n%s", m.View())
+	}
+	if cmd != nil {
+		t.Fatal("the drain was rescheduled after the channel closed; it would spin on a closed channel")
+	}
+}
+
+func TestDownloadEventFromAnAbandonedAttemptIsIgnored(t *testing.T) {
 	f := &fakes{}
 	m := testModel(t, f, 80)
 	m = typeURL(m, "https://example.com/v")
@@ -195,9 +250,28 @@ func TestFirstRunNoticeFromAnAbandonedAttemptIsIgnored(t *testing.T) {
 	m = typeURL(m, "https://example.com/other")
 	m = send(m, keyOf(tea.KeyEnter))
 
-	m = send(m, firstRunNoticeMsg{seq: stale})
+	m = send(m, resolveEventMsg{seq: stale, ev: ytdlp.ResolveDownloading})
 	if m.firstRun {
-		t.Fatal("a notice from an abandoned attempt changed the current one")
+		t.Fatal("an event from an abandoned attempt changed the current one")
+	}
+}
+
+func TestDownloadEventAfterResolveCompletedIsIgnored(t *testing.T) {
+	f := &fakes{resolveRes: ytdlp.Result{Path: "/tmp/yt-dlp"}}
+	m := testModel(t, f, 80)
+	m = typeURL(m, "https://example.com/v")
+	m = send(m, keyOf(tea.KeyEnter))
+	m = send(m, resolvedMsg{seq: m.seq, res: f.resolveRes})
+	if m.step != stepFetchingInfo {
+		t.Fatalf("step = %v, want stepFetchingInfo", m.step)
+	}
+
+	m = send(m, resolveEventMsg{seq: m.seq, ev: ytdlp.ResolveDownloading})
+	if m.firstRun {
+		t.Fatal("an event that arrived after Resolve had answered set firstRun")
+	}
+	if !strings.Contains(m.View(), "fetching video info…") {
+		t.Fatalf("a late event changed the status line:\n%s", m.View())
 	}
 }
 
