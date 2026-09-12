@@ -83,6 +83,15 @@ ended on. Anything reasoning about "the shutdown window" has to say which of the
 two routes it means; an issue written on the wrong one has already cost a
 release round.
 
+**`progress.SetPercent` drops the frame already scheduled.** It bumps the
+bar's tag, and `progress.Model.Update` ignores a `FrameMsg` carrying a stale
+tag. Never call it once per `progressMsg` while the bar is animating: yt-dlp
+fires its hook per block and the pump delivers as fast as the loop drains, so
+reports closer together than 16 ms would invalidate every frame before it
+fired and the bar would stand still until the reports paused. Re-target from
+the `FrameMsg` handler, or call it only when `IsAnimating()` is false. The
+invariant `model.go` keeps is `IsAnimating()` ⇒ a frame chain is alive.
+
 **Remote text is not safe to print.** Titles, uploaders and yt-dlp's own error
 messages come from a page we did not write. Strip control characters and escape
 sequences before measuring or rendering them. `lipgloss.Width` is a display-width

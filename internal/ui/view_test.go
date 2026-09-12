@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"github.com/charmbracelet/bubbles/spinner"
 	"strings"
 	"testing"
 
@@ -180,14 +181,228 @@ func TestInputScreenFramesTheBoxAndNamesTheApp(t *testing.T) {
 	m := testModel(t, f, 80)
 	view := m.View()
 
-	if !strings.Contains(view, appName) {
-		t.Fatalf("the app name is missing:\n%s", view)
+	// At 80x24 the name is the wordmark, drawn, not spelled.
+	for _, row := range wordmarkRows {
+		if !strings.Contains(view, row) {
+			t.Fatalf("the wordmark row %q is missing:\n%s", row, view)
+		}
+	}
+	if strings.Contains(view, appName) {
+		t.Fatalf("the one-line name is drawn under the wordmark:\n%s", view)
 	}
 	if !strings.Contains(view, "╭") || !strings.Contains(view, "╰") {
 		t.Fatalf("the input is not in a framed box:\n%s", view)
 	}
 	if !strings.Contains(view, "enter") {
 		t.Fatalf("the key legend is missing:\n%s", view)
+	}
+}
+
+func TestWordmarkRowsAreAllTheSameWidth(t *testing.T) {
+	w := wordmarkWidth()
+	for i, row := range wordmarkRows {
+		if got := lipgloss.Width(row); got != w {
+			t.Errorf("wordmark row %d is %d cells, want %d like the widest: %q", i, got, w, row)
+		}
+	}
+	if len(wordmarkRows) < 4 || len(wordmarkRows) > 5 {
+		t.Errorf("the wordmark is %d rows, want 4 or 5", len(wordmarkRows))
+	}
+}
+
+// inputHeader is the lines of an input screen above its box: the wordmark, or
+// the one-line name.
+func inputHeader(view string) []string {
+	var out []string
+	for _, line := range strings.Split(view, "\n") {
+		if strings.Contains(line, "╭") {
+			break
+		}
+		if strings.TrimSpace(line) != "" {
+			out = append(out, strings.TrimSpace(line))
+		}
+	}
+	return out
+}
+
+func TestWordmarkCollapsesToTheOneLineHeaderWithoutRoom(t *testing.T) {
+	collapsed := []string{appName}
+	cases := []struct {
+		name          string
+		width, height int
+		want          []string
+	}{
+		{"room for it", 80, 24, nil},
+		{"tall", 80, 30, nil},
+		{"just tall enough", 80, minWordmarkHeight, nil},
+		{"one row too short", 80, minWordmarkHeight - 1, collapsed},
+		{"height unknown", 80, 0, collapsed},
+		{"just wide enough", wordmarkWidth() + 4, 24, nil},
+		{"one column too narrow", wordmarkWidth() + 3, 24, collapsed},
+		{"narrow", 24, 24, collapsed},
+	}
+	for _, tc := range cases {
+		want := tc.want
+		if want == nil {
+			for _, row := range wordmarkRows {
+				want = append(want, strings.TrimSpace(row))
+			}
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			m := testModel(t, &fakes{}, tc.width)
+			m.height = tc.height
+			m.layout()
+			view := m.View()
+			// inputHeader is every non-blank line above the box, so a rule
+			// under the collapsed name would show up as a second line here;
+			// the collapsed header is meant to be exactly as it was before.
+			if got := inputHeader(view); !equalLines(got, want) {
+				t.Fatalf("at %dx%d the header is %q, want %q:\n%s", tc.width, tc.height, got, want, view)
+			}
+			if got := widest(view); got > max(tc.width, minContentWidth+4) {
+				t.Fatalf("at %dx%d the input screen is %d cells wide:\n%s", tc.width, tc.height, got, view)
+			}
+		})
+	}
+
+	// A resize is the ordinary route to a height: the wordmark follows it
+	// both ways.
+	m := testModel(t, &fakes{}, 80)
+	m = send(m, tea.WindowSizeMsg{Width: 80, Height: 10})
+	if got := inputHeader(m.View()); !equalLines(got, collapsed) {
+		t.Fatalf("after a resize to 10 rows the header is %q, want the one-line name", got)
+	}
+	m = send(m, tea.WindowSizeMsg{Width: 80, Height: 30})
+	if got := inputHeader(m.View()); len(got) != len(wordmarkRows) {
+		t.Fatalf("after a resize to 30 rows the header is %q, want the wordmark", got)
+	}
+}
+
+func TestEveryOtherScreenRulesUnderItsHeader(t *testing.T) {
+	for name, m := range screens(t) {
+		m = send(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+		lines := strings.Split(m.View(), "\n")
+		// Row 0 is the doc padding, row 1 the name, row 2 the rule.
+		if len(lines) < 3 {
+			t.Fatalf("%s rendered %d lines", name, len(lines))
+		}
+		rule := strings.TrimSpace(lines[2])
+		if name == "input" {
+			// The box's own border is drawn with the same character, so the
+			// check is on the header rows alone.
+			if got := inputHeader(m.View()); len(got) != len(wordmarkRows) {
+				t.Errorf("the input screen's header is %q, want the wordmark and nothing under it", got)
+			}
+			continue
+		}
+		if strings.TrimSpace(lines[1]) != appName {
+			t.Errorf("%s does not open on the one-line name: %q", name, lines[1])
+		}
+		if rule != strings.Repeat("─", m.contentWidth()) {
+			t.Errorf("%s has no rule the width of the content under its name: %q", name, rule)
+		}
+	}
+}
+
+func TestSweepBarIsAlwaysTheWidthAskedForAndMoves(t *testing.T) {
+	for _, width := range []int{1, 2, 5, 6, 7, 12, 30, 71, 92} {
+		for _, frame := range []int{0, 1, 2, 7, 100, 1001} {
+			if got := lipgloss.Width(sweepBar(width, frame)); got != width {
+				t.Errorf("sweepBar(%d, %d) is %d cells wide", width, frame, got)
+			}
+		}
+	}
+	if sweepBar(0, 3) != "" {
+		t.Errorf("sweepBar(0, 3) = %q, want nothing for no width", sweepBar(0, 3))
+	}
+
+	// The block's position over a full period: out to the far end, back to
+	// the near one, never off the track, and never the same two ticks running.
+	const width = 30
+	block := width / 6
+	travel := width - block
+	var positions []int
+	for frame := 0; frame <= 2*((travel+sweepStep-1)/sweepStep); frame++ {
+		plain := sgr.ReplaceAllString(sweepBar(width, frame), "")
+		pos := strings.Index(plain, "█")
+		if pos < 0 || strings.Count(plain, "█") != block {
+			t.Fatalf("frame %d: %q has no block of %d cells", frame, plain, block)
+		}
+		positions = append(positions, lipgloss.Width(plain[:pos]))
+	}
+	if positions[0] != 0 {
+		t.Errorf("the sweep starts at %d, want the left end: %v", positions[0], positions)
+	}
+	peak := 0
+	for i, p := range positions {
+		if p < 0 || p > travel {
+			t.Errorf("frame %d puts the block at %d, off a track with %d cells of room", i, p, travel)
+		}
+		if p > positions[peak] {
+			peak = i
+		}
+	}
+	if peak == 0 || peak == len(positions)-1 {
+		t.Fatalf("the sweep never turned round: %v", positions)
+	}
+	for i := 1; i < len(positions); i++ {
+		switch {
+		case i <= peak && positions[i] <= positions[i-1]:
+			t.Errorf("on the way out the block did not advance between frames %d and %d: %v", i-1, i, positions)
+		case i > peak && positions[i] >= positions[i-1]:
+			t.Errorf("on the way back the block did not retreat between frames %d and %d: %v", i-1, i, positions)
+		}
+	}
+}
+
+func TestSweepOffsetTurnsAtBothEnds(t *testing.T) {
+	// Five cells of room at two cells a frame: out in three frames, the last
+	// of them shortened to touch the end, back in three, and round again.
+	if sweepStep != 2 {
+		t.Fatalf("sweepStep = %d; these cases are written for 2", sweepStep)
+	}
+	cases := []struct{ travel, frame, want int }{
+		{5, 0, 0}, {5, 1, 2}, {5, 2, 4}, {5, 3, 5}, {5, 4, 3}, {5, 5, 1}, {5, 6, 0}, {5, 7, 2}, {5, 13, 2},
+		{4, 0, 0}, {4, 1, 2}, {4, 2, 4}, {4, 3, 2}, {4, 4, 0},
+		{0, 7, 0}, {-3, 7, 0}, {5, -1, 1},
+	}
+	for _, tc := range cases {
+		if got := sweepOffset(tc.travel, tc.frame); got != tc.want {
+			t.Errorf("sweepOffset(%d, %d) = %d, want %d", tc.travel, tc.frame, got, tc.want)
+		}
+	}
+}
+
+func TestMergingSweepsOnTheSpinnerTick(t *testing.T) {
+	m := downloadingModel(t, &fakes{})
+	m = send(m, progressMsg{seq: m.seq, p: ytdlp.Progress{
+		Phase: ytdlp.PhaseMerging, Downloaded: 64_000_000, DownloadedKnown: true,
+		Total: 64_000_000, TotalKnown: true,
+	}})
+	before := m.barLine()
+	m = send(m, m.spin.Tick())
+	after := m.barLine()
+
+	if before == after {
+		t.Fatalf("a spinner tick did not move the sweep:\n%s", before)
+	}
+	// The label slot is percentLabel's, untouched: a merge of a download whose
+	// bytes were all counted reads 100%.
+	for _, line := range []string{before, after} {
+		if !strings.HasSuffix(line, "100%") {
+			t.Errorf("the sweep line does not keep the percent label: %q", line)
+		}
+		if strings.Count(line, "█") != (m.contentWidth()-lipgloss.Width("100%")-2)/6 {
+			t.Errorf("the sweep block is not a sixth of the bar: %q", line)
+		}
+	}
+
+	// A tick from an abandoned chain is not a frame.
+	stale := m.spin.Tick().(spinner.TickMsg)
+	m = send(m, m.spin.Tick())
+	moved := m.barLine()
+	if again := send(m, stale).barLine(); again != moved {
+		t.Errorf("a stale tick moved the sweep:\n%s\n%s", moved, again)
 	}
 }
 

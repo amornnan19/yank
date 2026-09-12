@@ -216,12 +216,15 @@ func TestTheSelectedRowIsTruncatedBeforeItIsStyled(t *testing.T) {
 	// which the order of truncate and Render can be told apart.
 	m = send(m, tea.WindowSizeMsg{Width: 28, Height: 24})
 
+	// The rows are found on their text with the styling stripped: the number
+	// cell of an unselected row is faint, so the sequence that opens it sits
+	// between the marker and the digit.
 	var selected, unselected string
 	for _, line := range strings.Split(m.View(), "\n") {
-		switch {
-		case strings.Contains(line, selectedMarker+"1."):
+		switch plain := sgr.ReplaceAllString(line, ""); {
+		case strings.Contains(plain, selectedMarker+"1."):
 			selected = line
-		case strings.Contains(line, unselectedMarker+"2."):
+		case strings.Contains(plain, unselectedMarker+"2."):
 			unselected = line
 		}
 	}
@@ -614,14 +617,50 @@ func trueColour(t *testing.T) {
 	lipgloss.SetColorProfile(termenv.TrueColor)
 }
 
-// colourScreens is screens plus the states that only differ by a style: the
-// first-run wording, the converting phase, the done screen without its note,
-// and a picker with the cursor moved. Every model gets a bar that renders at
-// TrueColor, because progress.New reads the real stdout's profile and would
-// otherwise draw the bar plain whatever lipgloss was told.
+// colourScreens is screens plus the states that only differ by a style or by
+// motion: the first-run wording, the converting phase, the done screen without
+// its note, a picker with the cursor moved, the input screen at a height that
+// shows the wordmark and one that collapses it, the bar one spring frame into
+// a report, and the merging sweep at two consecutive ticks. Every model gets a
+// bar that renders at TrueColor, because progress.New reads the real stdout's
+// profile and would otherwise draw the bar plain whatever lipgloss was told.
+// The bar is swapped in before the messages that move it, so the animated
+// entries are animating the bar the test looks at.
 func colourScreens(t *testing.T) map[string]Model {
 	t.Helper()
 	out := screens(t)
+	for name, m := range out {
+		out[name] = colourBar(m)
+	}
+
+	tall := testModel(t, &fakes{}, 80)
+	tall.height = 30
+	out["input tall"] = tall
+
+	short := testModel(t, &fakes{}, 80)
+	short.height = 10
+	out["input short"] = short
+
+	sprung := colourBar(downloadingModel(t, &fakes{}))
+	sprung, cmd := step(sprung, progressMsg{seq: sprung.seq, p: ytdlp.Progress{
+		Phase: ytdlp.PhaseDownloading, Downloaded: 30_100_000, DownloadedKnown: true,
+		Total: 64_000_000, TotalKnown: true,
+	}})
+	sprung, _ = advance(t, sprung, cmd)
+	if !sprung.bar.IsAnimating() {
+		t.Fatal("one frame into a report the bar has already stopped; the spring is not running")
+	}
+	out["downloading after a frame"] = sprung
+
+	sweep := colourBar(downloadingModel(t, &fakes{}))
+	sweep = send(sweep, progressMsg{seq: sweep.seq, p: ytdlp.Progress{
+		Phase: ytdlp.PhaseMerging, Downloaded: 64_000_000, DownloadedKnown: true,
+		Total: 64_000_000, TotalKnown: true,
+	}})
+	sweep = send(sweep, sweep.spin.Tick())
+	out["merging sweep frame 1"] = sweep
+	sweep = send(sweep, sweep.spin.Tick())
+	out["merging sweep frame 2"] = sweep
 
 	firstRun := testModel(t, &fakes{}, 80)
 	firstRun.hasBin = true
@@ -645,19 +684,27 @@ func colourScreens(t *testing.T) map[string]Model {
 	done = send(done, downloadDoneMsg{seq: done.seq, res: &ytdlp.DownloadResult{Path: "/Users/x/Downloads/a b.mp4"}})
 	out["done without note"] = done
 
-	for name, m := range out {
-		m.bar = newBar(progress.WithColorProfile(termenv.TrueColor))
-		out[name] = m
+	for _, name := range []string{"probing first run", "picker cursor moved", "converting", "done without note"} {
+		out[name] = colourBar(out[name])
 	}
 	return out
+}
+
+// colourBar gives m a bar that renders at TrueColor; see colourScreens.
+func colourBar(m Model) Model {
+	m.bar = newBar(progress.WithColorProfile(termenv.TrueColor))
+	return m
 }
 
 func TestEveryScreenUsesOnlyTheTerminalsOwnPalette(t *testing.T) {
 	trueColour(t)
 
-	for _, width := range []int{80, 120, 24} {
+	for _, width := range []int{80, 120, 24, 20} {
 		for name, m := range colourScreens(t) {
-			m = send(m, tea.WindowSizeMsg{Width: width, Height: 24})
+			// The height is the model's own: the two input entries differ
+			// only by it, and a resize that reset it would render the same
+			// screen twice.
+			m = send(m, tea.WindowSizeMsg{Width: width, Height: m.height})
 			view := m.View()
 			if !strings.ContainsRune(view, escape) {
 				t.Fatalf("%s at width %d rendered no escape sequence at TrueColor; the profile is not in effect and this test can see nothing", name, width)
@@ -731,6 +778,130 @@ func TestTheSelectedRowsReverseBlockSpansTheContentWidth(t *testing.T) {
 		}
 		if got := lipgloss.Width(reversed[1]); got != cw {
 			t.Errorf("at width %d the reverse block covers %d cells, want %d: %q", width, got, cw, reversed[1])
+		}
+	}
+}
+
+func TestUnselectedRowNumbersAreFaintAndNothingElseMoves(t *testing.T) {
+	trueColour(t)
+
+	m := pickerModel(t, &fakes{}, true, threeRows())
+	m = send(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	cw := m.contentWidth()
+	plainRows := pickerLines(m.rows, m.cursor, cw)
+
+	faint := regexp.MustCompile(`^  \x1b\[2m([1-9]\. )\x1b\[0?m`)
+	seen := 0
+	for _, line := range strings.Split(m.View(), "\n") {
+		line = strings.TrimPrefix(line, "  ") // the doc margin
+		plain := sgr.ReplaceAllString(line, "")
+		for i, row := range plainRows {
+			if i == m.cursor || strings.TrimRight(plain, " ") != strings.TrimRight(row, " ") {
+				continue
+			}
+			seen++
+			// The number cell is faint and closed again before the row's
+			// text begins, so the text itself stays in the terminal's own
+			// foreground and the row is exactly as wide as pickerLines made it.
+			sub := faint.FindStringSubmatch(line)
+			if sub == nil || sub[1] != rowNumber(i) {
+				t.Errorf("row %d does not open with its number cell in faint: %q", i, line)
+			}
+			if rest := line[len(sub[0]):]; strings.ContainsRune(rest, escape) {
+				t.Errorf("row %d carries styling past its number cell: %q", i, line)
+			}
+			// Trimmed, because the doc style pads every line of the frame
+			// to the block's width; the text before the padding is the row.
+			if got := lipgloss.Width(strings.TrimRight(line, " ")); got != lipgloss.Width(strings.TrimRight(row, " ")) {
+				t.Errorf("row %d is %d cells styled and %d plain: %q", i, got, lipgloss.Width(row), line)
+			}
+		}
+	}
+	if want := len(plainRows) - 1; seen != want {
+		t.Fatalf("found %d unselected rows in the frame, want %d:\n%q", seen, want, m.View())
+	}
+}
+
+func TestDoneAndErrorScreensFrameTheirText(t *testing.T) {
+	trueColour(t)
+
+	done := downloadingModel(t, &fakes{})
+	done = send(done, downloadDoneMsg{seq: done.seq, res: &ytdlp.DownloadResult{Path: "/Users/x/Downloads/a b.mp4"}})
+	failed := downloadingModel(t, &fakes{})
+	failed = send(failed, downloadDoneMsg{seq: failed.seq, err: hardErr()})
+
+	// framed reports whether text sits on a line between two box sides, with
+	// the box's top edge somewhere above it and its bottom edge somewhere
+	// below, every row between being a row of the same box. The text may be
+	// on any row of the box: the error wraps and the path is cut.
+	framed := func(view, text string) bool {
+		var plain []string
+		for _, line := range strings.Split(view, "\n") {
+			plain = append(plain, strings.TrimSpace(sgr.ReplaceAllString(line, "")))
+		}
+		side := func(n int) bool {
+			return n >= 0 && n < len(plain) && strings.HasPrefix(plain[n], "│") && strings.HasSuffix(plain[n], "│")
+		}
+		for n, line := range plain {
+			if !strings.Contains(line, text) {
+				continue
+			}
+			if !side(n) {
+				return false
+			}
+			top := n - 1
+			for side(top) {
+				top--
+			}
+			bottom := n + 1
+			for side(bottom) {
+				bottom++
+			}
+			return top >= 0 && strings.HasPrefix(plain[top], "╭") &&
+				bottom < len(plain) && strings.HasPrefix(plain[bottom], "╰")
+		}
+		return false
+	}
+	// borderSGR is the colour the box's corner is drawn in.
+	borderSGR := func(view string) string {
+		for _, line := range strings.Split(view, "\n") {
+			if strings.Contains(line, "╭") {
+				m := sgr.FindStringSubmatch(line)
+				if m != nil {
+					return m[1]
+				}
+			}
+		}
+		return ""
+	}
+
+	for _, width := range []int{80, 120, 24} {
+		d := send(done, tea.WindowSizeMsg{Width: width, Height: 24})
+		// The head of the path: at 24 columns the tail is cut.
+		if !framed(d.View(), "/Users/x/D") {
+			t.Errorf("at width %d the saved path is not framed:\n%s", width, d.View())
+		}
+		if got := borderSGR(d.View()); got != "32" {
+			t.Errorf("at width %d the done box border is SGR %q, want 32 (ANSI green):\n%q", width, got, d.View())
+		}
+		e := send(failed, tea.WindowSizeMsg{Width: width, Height: 24})
+		// The last word: at 24 columns the sentence wraps inside the box.
+		if !framed(e.View(), "private.") {
+			t.Errorf("at width %d the error text is not framed:\n%s", width, e.View())
+		}
+		if got := borderSGR(e.View()); got != "31" {
+			t.Errorf("at width %d the error box border is SGR %q, want 31 (ANSI red):\n%q", width, got, e.View())
+		}
+	}
+
+	// One column narrower than a frame is allowed at, both draw bare.
+	for name, m := range map[string]Model{"done": done, "error": failed} {
+		m = send(m, tea.WindowSizeMsg{Width: minBoxedWidth + 3, Height: 24})
+		if strings.Contains(m.View(), "╭") {
+			t.Errorf("the %s screen is framed at width %d, below the floor:\n%s", name, minBoxedWidth+3, m.View())
+		}
+		if got := widest(m.View()); got > minBoxedWidth+3 {
+			t.Errorf("the bare %s screen is %d cells wide at width %d", name, got, minBoxedWidth+3)
 		}
 	}
 }

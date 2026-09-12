@@ -2,6 +2,8 @@ package ui
 
 import (
 	"context"
+	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/lipgloss"
 	"strings"
 	"testing"
 
@@ -578,12 +580,194 @@ func TestProgressUpdatesTheBarAndReschedulesTheDrain(t *testing.T) {
 
 	// The drain must reschedule itself, or the second update never arrives.
 	// The fixture's Download has already closed the channel, so the follow-up
-	// answers with the closed message rather than blocking.
+	// answers with the closed message rather than blocking. It comes back in
+	// a batch beside the bar's first spring frame.
 	if cmd == nil {
 		t.Fatal("a progress update produced no follow-up drain")
 	}
-	if _, ok := cmd().(progressClosedMsg); !ok {
-		t.Fatal("the follow-up command is not another drain of the progress channel")
+	msgs := collect(t, cmd)
+	if _, ok := findMsg[progressClosedMsg](msgs); !ok {
+		t.Fatalf("the follow-up commands do not drain the progress channel again: %v", msgs)
+	}
+	if _, ok := findMsg[progress.FrameMsg](msgs); !ok {
+		t.Fatalf("a known percentage did not start the bar's spring: %v", msgs)
+	}
+}
+
+// filledCells is how many cells of a rendered bar line are the fill rune, the
+// styling stripped so the count is the same at every colour profile.
+func filledCells(line string) int {
+	return strings.Count(sgr.ReplaceAllString(line, ""), "█")
+}
+
+// springFrames feeds the bar's frames back into the model until the spring
+// comes to rest, returning the filled-cell count after each one. cap bounds a
+// spring that never settles; the default one settles in well under it.
+func springFrames(t *testing.T, m Model, cmd tea.Cmd) (Model, []int) {
+	t.Helper()
+	var filled []int
+	for range 600 {
+		frame, ok := findMsg[progress.FrameMsg](collect(t, cmd))
+		if !ok {
+			return m, filled
+		}
+		m, cmd = step(m, frame)
+		filled = append(filled, filledCells(m.barLine()))
+	}
+	t.Fatal("the bar's spring produced 600 frames without coming to rest")
+	return m, filled
+}
+
+func TestTheBarSpringsTowardsTheReportAndANewDownloadStartsItOver(t *testing.T) {
+	f := &fakes{}
+	m := downloadingModel(t, f)
+	if got := filledCells(m.barLine()); got != 0 {
+		t.Fatalf("the bar starts with %d cells filled, want 0", got)
+	}
+
+	m, cmd := step(m, progressMsg{seq: m.seq, p: ytdlp.Progress{
+		Phase: ytdlp.PhaseDownloading, Downloaded: 32_000_000, DownloadedKnown: true,
+		Total: 64_000_000, TotalKnown: true,
+	}})
+	// The label is the report; the bar has not moved yet, that is the point.
+	if line := m.barLine(); !strings.Contains(line, "50%") || filledCells(line) != 0 {
+		t.Fatalf("straight after the report the bar line is %q, want the 50%% label beside a bar that has not jumped", line)
+	}
+
+	m, filled := springFrames(t, m, cmd)
+
+	if len(filled) < 3 {
+		t.Fatalf("the spring settled after %d frames; that is a jump, not a slide: %v", len(filled), filled)
+	}
+	for i := 1; i < len(filled); i++ {
+		if filled[i] < filled[i-1] {
+			t.Fatalf("the bar went backwards between frames %d and %d: %v", i-1, i, filled)
+		}
+	}
+	width := m.contentWidth() - lipgloss.Width(percentLabel(50, true)) - 2
+	if want, got := width/2, filled[len(filled)-1]; got < want-1 || got > want+1 {
+		t.Fatalf("the spring settled at %d of %d cells, want about %d", got, width, want)
+	}
+	if m.bar.IsAnimating() {
+		t.Fatal("the frames ran out while the bar still says it is animating")
+	}
+
+	// esc, another submit, another download: the bar starts from nothing
+	// rather than sliding down from where the last one left it.
+	m = send(m, keyOf(tea.KeyEsc))
+	m = typeURL(m, "https://example.com/again")
+	m, cmd = step(m, keyOf(tea.KeyEnter))
+	m, _ = advance(t, m, cmd)
+	if m.state != statePicker {
+		t.Fatalf("state = %v after the second submit, want statePicker", m.state)
+	}
+	m = send(m, keyOf(tea.KeyEnter))
+	if m.state != stateDownloading {
+		t.Fatalf("state = %v, want stateDownloading", m.state)
+	}
+	if m.bar.IsAnimating() {
+		t.Fatal("the new download's bar is still animating the old one's spring")
+	}
+	// Before a report the bar is drawn at zero whatever its spring holds, so
+	// the first report is where a bar carried over from the last download
+	// would show: it would draw the old 50% beside the new label.
+	m = send(m, progressMsg{seq: m.seq, p: ytdlp.Progress{
+		Phase: ytdlp.PhaseDownloading, Downloaded: 6_400_000, DownloadedKnown: true,
+		Total: 64_000_000, TotalKnown: true,
+	}})
+	if line := m.barLine(); filledCells(line) != 0 || !strings.Contains(line, "10%") {
+		t.Fatalf("the new download's first report drew %q, want an empty bar beside 10%%", line)
+	}
+}
+
+// report is a downloading progressMsg for m at pct of a 64 MB total.
+func report(m Model, pct int64) progressMsg {
+	return progressMsg{seq: m.seq, p: ytdlp.Progress{
+		Phase: ytdlp.PhaseDownloading, Downloaded: 640_000 * pct, DownloadedKnown: true,
+		Total: 64_000_000, TotalKnown: true,
+	}}
+}
+
+func TestDenseReportsDoNotStarveTheSpring(t *testing.T) {
+	// Three reports land before the frame the first one scheduled has fired,
+	// which is what yt-dlp's per-block hook does on any fast connection. The
+	// bar must keep moving on that first frame's chain and end up at the
+	// last report, not stand still because each report threw away the frame
+	// the one before it had scheduled.
+	f := &fakes{}
+	m := downloadingModel(t, f)
+
+	m, first := step(m, report(m, 50))
+	var later []tea.Cmd
+	for _, pct := range []int64{60, 70} {
+		var cmd tea.Cmd
+		m, cmd = step(m, report(m, pct))
+		later = append(later, cmd)
+	}
+	// The later reports start no chain of their own: one is already alive.
+	for i, cmd := range later {
+		if _, ok := findMsg[progress.FrameMsg](collect(t, cmd)); ok {
+			t.Fatalf("report %d scheduled a frame while the bar was already animating", i+2)
+		}
+	}
+
+	m, filled := springFrames(t, m, first)
+
+	if len(filled) < 3 {
+		t.Fatalf("the first report's frame chain died after %d frames: %v", len(filled), filled)
+	}
+	for i := 1; i < len(filled); i++ {
+		if filled[i] < filled[i-1] {
+			t.Fatalf("the bar went backwards between frames %d and %d: %v", i-1, i, filled)
+		}
+	}
+	width := m.contentWidth() - lipgloss.Width(percentLabel(70, true)) - 2
+	if want, got := width*7/10, filled[len(filled)-1]; got < want-1 || got > want+1 {
+		t.Fatalf("the spring settled at %d of %d cells, want about %d (the last report): %v", got, width, want, filled)
+	}
+}
+
+func TestAReportOfOneHundredPercentDrawsTheBarFull(t *testing.T) {
+	// Between yt-dlp's last progress line and the downloadDoneMsg the label
+	// reads 100%; the picture must not still be sliding beside it.
+	f := &fakes{}
+	m := downloadingModel(t, f)
+	m = send(m, report(m, 100))
+
+	line := m.barLine()
+	width := m.contentWidth() - lipgloss.Width(percentLabel(100, true)) - 2
+	if got := filledCells(line); got != width {
+		t.Fatalf("at a 100%% report the bar has %d of %d cells filled: %q", got, width, line)
+	}
+	if !strings.HasSuffix(line, "100%") {
+		t.Fatalf("the label is not 100%%: %q", line)
+	}
+}
+
+func TestAFrameArrivingAfterEscIsDropped(t *testing.T) {
+	// bubbles schedules the next frame before Update sees the key, so one
+	// always lands after esc. It must neither move the bar nor reschedule:
+	// a chain that kept ticking would run a spring nobody is looking at.
+	f := &fakes{}
+	m := downloadingModel(t, f)
+	m, cmd := step(m, progressMsg{seq: m.seq, p: ytdlp.Progress{
+		Phase: ytdlp.PhaseDownloading, Downloaded: 32_000_000, DownloadedKnown: true,
+		Total: 64_000_000, TotalKnown: true,
+	}})
+	frame, ok := findMsg[progress.FrameMsg](collect(t, cmd))
+	if !ok {
+		t.Fatal("the report scheduled no frame")
+	}
+
+	m = send(m, keyOf(tea.KeyEsc))
+	before := m.bar.View()
+	m, cmd = step(m, frame)
+
+	if cmd != nil {
+		t.Errorf("a frame after esc rescheduled itself: %v", collect(t, cmd))
+	}
+	if m.bar.View() != before {
+		t.Errorf("a frame after esc moved the bar:\n%q\n%q", before, m.bar.View())
 	}
 }
 

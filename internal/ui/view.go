@@ -17,7 +17,7 @@ const appName = "yank"
 // work a screen needs has already happened in a tea.Cmd and landed in a field.
 func (m Model) View() string {
 	if m.quitting {
-		return styles().doc.Render(styles().app.Render(appName) + "\n\n" + m.quittingView())
+		return styles().doc.Render(m.header() + m.quittingView())
 	}
 
 	var body string
@@ -35,7 +35,24 @@ func (m Model) View() string {
 	default:
 		body = m.inputView()
 	}
-	return styles().doc.Render(styles().app.Render(appName) + "\n\n" + body)
+	return styles().doc.Render(m.header() + body)
+}
+
+// header is what stands above the body. An input screen with room for it opens
+// on the wordmark; one without gets the one-line name alone, exactly as every
+// screen was drawn before the wordmark existed; every other screen gets the
+// name over a faint rule the width of the content, so the name reads as a
+// heading rather than as a word left at the top of the page.
+func (m Model) header() string {
+	name := styles().app.Render(appName)
+	cw := m.contentWidth()
+	if m.state == stateInput && !m.quitting {
+		if m.wordmarkFits() {
+			return wordmarkView(cw) + "\n\n"
+		}
+		return name + "\n\n"
+	}
+	return name + "\n" + styles().faint.Render(strings.Repeat("─", cw)) + "\n\n"
 }
 
 // --- screens ----------------------------------------------------------------
@@ -53,14 +70,25 @@ func (m Model) inputView() string {
 // The spinner keeps moving so the screen does not read as a hang, and the
 // legend says the way out is the key that was just pressed.
 func (m Model) quittingView() string {
-	return m.spin.View() + " " + truncate("stopping…", m.contentWidth()-2) + "\n\n" +
+	return m.spinLine(lipgloss.NewStyle(), "stopping…") + "\n\n" +
 		m.help("ctrl+c  quit now")
 }
 
 func (m Model) probingView() string {
-	// The spinner and its space cost two cells; the status line gets the rest.
-	return m.spin.View() + " " + truncate(m.statusLine(), m.contentWidth()-2) + "\n\n" +
+	return m.spinLine(styles().spinner, m.statusLine()) + "\n\n" +
 		m.help("esc  cancel", "ctrl+c  quit")
+}
+
+// spinLine is the spinner, in style, followed by text cut to what is left of
+// the content width. The style is put on a copy at render time — the probing
+// screen's colour, the phase colour, or none on the quitting screen — so there
+// is one spinner model and one tick behind all three. Dot's frames end in a
+// space, so the frame is the whole prefix; what it costs is measured on the
+// bare frame, never on the styled view.
+func (m Model) spinLine(style lipgloss.Style, text string) string {
+	spin := m.spin
+	spin.Style = style
+	return spin.View() + truncate(text, m.contentWidth()-lipgloss.Width(spin.Spinner.Frames[0]))
 }
 
 // statusLine says what the spinner is waiting for. Resolving gets two wordings:
@@ -98,13 +126,27 @@ func (m Model) pickerView() string {
 			body = append(body, fit(styles().selected, line, cw))
 			continue
 		}
-		body = append(body, line)
+		body = append(body, faintRowNumber(i, line))
 	}
 	if !m.bin.HasFFmpeg {
 		body = append(body, "", styles().faint.Render(wrap(noFFmpegHint, cw)))
 	}
 	return join(body...) + "\n\n" +
 		m.help("↑↓ jk  move", "1-9  jump", "enter  download", "esc  back")
+}
+
+// faintRowNumber dims the "1. " cell of an unselected row so the eye lands on
+// the quality column rather than on the digits. It takes the row after
+// pickerLines has cut it and styles the number cell alone, leaving the text
+// either side exactly as it was, so the row is still as wide as pickerLines
+// made it and nothing styled is ever measured or cut. A row cut so short that
+// the cell did not survive is returned untouched.
+func faintRowNumber(i int, line string) string {
+	rest, ok := strings.CutPrefix(line, unselectedMarker+rowNumber(i))
+	if !ok {
+		return line
+	}
+	return unselectedMarker + styles().faint.Render(rowNumber(i)) + rest
 }
 
 // pickerLines is every picker row as unstyled text, one string per row, each
@@ -282,25 +324,16 @@ func (m Model) downloadingView() string {
 	case m.retrying:
 		// The saved info-json's media URLs expired while the picker was up.
 		// Nothing has failed; a fresh extraction is on its way.
-		lines = append(lines, m.phaseSpinner()+" "+truncate(retryingMessage, cw-2))
+		lines = append(lines, m.spinLine(styles().phase, retryingMessage))
 	case m.hasProg && m.prog.Phase == ytdlp.PhaseMerging:
-		lines = append(lines, m.phaseSpinner()+" "+truncate("merging video and audio…", cw-2))
+		lines = append(lines, m.spinLine(styles().phase, "merging video and audio…"))
 	case m.hasProg && m.prog.Phase == ytdlp.PhaseConverting:
-		lines = append(lines, m.phaseSpinner()+" "+truncate("converting audio…", cw-2))
+		lines = append(lines, m.spinLine(styles().phase, "converting audio…"))
 	default:
 		lines = append(lines, fit(styles().faint, m.statsLine(), cw))
 	}
 
 	return join(lines...) + "\n\n" + m.help("esc  cancel", "ctrl+c  quit")
-}
-
-// phaseSpinner is the spinner as drawn on the phase lines: the same frames as
-// everywhere else, in the phase colour. It is a style applied at render time,
-// not a second spinner model, so there is one tick to keep in step.
-func (m Model) phaseSpinner() string {
-	spin := m.spin
-	spin.Style = styles().phase
-	return spin.View()
 }
 
 // retryingMessage is the one line the stale-info retry shows. It says what
@@ -310,6 +343,16 @@ const retryingMessage = "the download link had expired — fetching fresh video 
 // barLine is the progress bar with its percentage. The bar is drawn even when
 // the percentage is unknown: an empty bar beside "--%" says "no idea how far
 // along", where no bar at all says "nothing is happening".
+//
+// With a known percentage the bar draws where its spring has got to — Update
+// handed it the figure on the progressMsg and the FrameMsgs since have been
+// walking it there — while the label is percentLabel of the figure itself, so
+// the number is always yt-dlp's and only the picture is smoothed. The one
+// exception is a report of 100%: the bar is drawn full at once, because the
+// window between yt-dlp's last progress line and the downloadDoneMsg is the
+// one where a label saying 100% beside a bar still sliding would be read as
+// a contradiction rather than as smoothing. In a stretch with no bytes to
+// count the bar sweeps instead; see indeterminate.
 func (m Model) barLine() string {
 	pct, known := m.prog.Percent()
 	label := percentLabel(pct, known)
@@ -317,11 +360,82 @@ func (m Model) barLine() string {
 	// still fits the terminal.
 	bar := m.bar
 	bar.Width = max(1, m.contentWidth()-lipgloss.Width(label)-2)
-	fill := 0.0
-	if known {
-		fill = pct / 100
+	var drawn string
+	switch {
+	case m.indeterminate():
+		drawn = sweepBar(bar.Width, m.frame)
+	case known && pct >= 100:
+		drawn = bar.ViewAs(1)
+	case known:
+		drawn = bar.View()
+	default:
+		drawn = bar.ViewAs(0)
 	}
-	return bar.ViewAs(fill) + "  " + label
+	return drawn + "  " + label
+}
+
+// indeterminate reports whether the download screen is in a stretch with
+// nothing to count: merging, converting, or re-fetching expired video info.
+// There is no percentage of a merge, so a filling bar would either sit still
+// or lie; a sweeping one says "working, no idea how far".
+func (m Model) indeterminate() bool {
+	if m.retrying {
+		return true
+	}
+	return m.hasProg && (m.prog.Phase == ytdlp.PhaseMerging || m.prog.Phase == ytdlp.PhaseConverting)
+}
+
+// sweepStep is how many cells the sweep block moves per spinner tick. The
+// spinner ticks ten times a second, and one cell a tick takes a bar the width
+// of an 80-column terminal six seconds to cross, which reads as a crawl.
+const sweepStep = 2
+
+// sweepBar is the indeterminate bar: a block in the phase colour, about a
+// sixth of the width, sweeping left to right and back over a faint track.
+// frame is the spinner's tick count, so the block and the spinner move on the
+// one clock. It is exactly width cells wide at every frame, and it is built
+// from three runs it sizes itself, so nothing here is measured or cut after
+// styling.
+func sweepBar(width, frame int) string {
+	if width <= 0 {
+		return ""
+	}
+	block := max(1, width/6)
+	pos := sweepOffset(width-block, frame)
+	return run(styles().faint, "░", pos) +
+		run(styles().phase, "█", block) +
+		run(styles().faint, "░", width-block-pos)
+}
+
+// sweepOffset is where the block's left edge sits at frame on a track with
+// travel cells of room: sweepStep cells further out each frame until it
+// touches the far end, then sweepStep back each frame until it touches the
+// near one, and out again. The last step to either end is shortened rather
+// than the block held there for a frame, so it is somewhere new on every tick
+// and never past an end. A track with no room leaves it at 0.
+func sweepOffset(travel, frame int) int {
+	if travel <= 0 {
+		return 0
+	}
+	steps := (travel + sweepStep - 1) / sweepStep // frames from one end to the other
+	k := frame % (2 * steps)
+	if k < 0 {
+		k += 2 * steps
+	}
+	if k <= steps {
+		return min(travel, k*sweepStep)
+	}
+	return max(0, travel-(k-steps)*sweepStep)
+}
+
+// run is n copies of cell in style, or nothing at all for n of zero — a style
+// rendered around an empty string still emits its escape sequences, which is
+// noise on the line and a stray pair for the palette test to trip over.
+func run(style lipgloss.Style, cell string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return style.Render(strings.Repeat(cell, n))
 }
 
 func (m Model) statsLine() string {
@@ -350,7 +464,7 @@ func (m Model) doneView() string {
 	cw := m.contentWidth()
 	lines := []string{fit(styles().success, savedTitle, cw), ""}
 	if m.result != nil {
-		lines = append(lines, fit(styles().path, m.result.Path, m.pathWidth()))
+		lines = append(lines, m.pathView(m.result.Path))
 		if m.result.UsedWorkingDir {
 			// DownloadsDir fell back. Saying "check your Downloads folder"
 			// would send the user to a directory the file is not in.
@@ -358,6 +472,29 @@ func (m Model) doneView() string {
 		}
 	}
 	return join(lines...) + "\n\n" + m.help("enter  another", "q  quit")
+}
+
+// minBoxedWidth is the narrowest content the done and error screens frame. A
+// box costs boxOverhead of every line, and below this the frame would take a
+// fifth of a line that is already short of room, so the path and the error
+// text are drawn bare instead, as they were before the frames existed. The
+// URL box is not subject to it: the input screen has always been framed.
+const minBoxedWidth = 20
+
+// pathView is the saved path, cut to its own budget and framed in the success
+// colour. The path is cut first and the box drawn round what is left, never
+// the other way about. The frame is as wide as the content, or as wide as the
+// path when the path is the wider one: pathWidth is not capped where
+// contentWidth is, and a box held to the content width around a longer path
+// would wrap what truncate had already fitted.
+func (m Model) pathView(path string) string {
+	cw := m.contentWidth()
+	if cw < minBoxedWidth {
+		return fit(styles().path, path, m.pathWidth())
+	}
+	cut := truncate(path, m.pathWidth()-boxOverhead)
+	inner := max(cw-boxOverhead, lipgloss.Width(cut))
+	return styles().savedBox.Width(inner + 2).Render(styles().path.Render(cut))
 }
 
 // savedTitle and failedTitle head the two ending screens. The glyph carries
@@ -375,8 +512,20 @@ func (m Model) errorView() string {
 	return join(
 		fit(styles().failure, failedTitle, cw),
 		"",
-		wrap(m.errMsg, cw),
+		m.errMsgView(),
 	) + "\n\n" + m.help("esc  back", "ctrl+c  quit")
+}
+
+// errMsgView is the error text, wrapped and framed in the failure colour. The
+// text is wrapped to the width inside the frame before the frame is drawn, so
+// the box never wraps anything itself; on a terminal too narrow for a frame
+// the text is wrapped to the content width and drawn bare.
+func (m Model) errMsgView() string {
+	cw := m.contentWidth()
+	if cw < minBoxedWidth {
+		return wrap(m.errMsg, cw)
+	}
+	return styles().failedBox.Width(cw - 2).Render(wrap(m.errMsg, cw-boxOverhead))
 }
 
 // --- shared bits ------------------------------------------------------------

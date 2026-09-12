@@ -41,8 +41,17 @@ type styleSet struct {
 	// checks they got right.
 	title lipgloss.Style
 
-	// box frames the URL input.
-	box lipgloss.Style
+	// box frames the URL input. savedBox and failedBox frame the saved path
+	// and the error text on the two ending screens, in the colour of the
+	// outcome, so the frame carries the same signal as the heading above it.
+	box       lipgloss.Style
+	savedBox  lipgloss.Style
+	failedBox lipgloss.Style
+
+	// spinner colours the spinner on the probing screen. Like phase below it
+	// is applied at render time to the one spinner model, not kept as a
+	// second spinner, so there is one tick to keep in step.
+	spinner lipgloss.Style
 
 	// selected marks the picker row under the cursor. Reverse video across
 	// the whole row plus bold and the "▸" marker: reverse works on a terminal
@@ -52,7 +61,8 @@ type styleSet struct {
 
 	// phase colours the spinner on the lines where yank is doing something
 	// other than downloading — merging, converting, re-fetching expired info —
-	// so the transition is visible without reading the wording.
+	// so the transition is visible without reading the wording. The block
+	// that sweeps the indeterminate bar on those lines is drawn in it too.
 	phase lipgloss.Style
 
 	// success and failure head the done and error screens. Two outcomes that
@@ -87,20 +97,39 @@ type styleSet struct {
 var styles = sync.OnceValue(func() styleSet {
 	styleBuilds.Add(1)
 	return styleSet{
-		app:      lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(ansiCyan)),
-		faint:    lipgloss.NewStyle().Faint(true),
-		title:    lipgloss.NewStyle().Bold(true),
-		box:      lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1),
-		selected: lipgloss.NewStyle().Bold(true).Reverse(true),
-		phase:    lipgloss.NewStyle().Foreground(lipgloss.Color(ansiYellow)),
-		success:  lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(ansiGreen)),
-		failure:  lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(ansiRed)),
+		app:       lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(ansiCyan)),
+		faint:     lipgloss.NewStyle().Faint(true),
+		title:     lipgloss.NewStyle().Bold(true),
+		box:       frame(ansiCyan),
+		savedBox:  frame(ansiGreen),
+		failedBox: frame(ansiRed),
+		selected:  lipgloss.NewStyle().Bold(true).Reverse(true),
+		spinner:   lipgloss.NewStyle().Foreground(lipgloss.Color(ansiCyan)),
+		phase:     lipgloss.NewStyle().Foreground(lipgloss.Color(ansiYellow)),
+		success:   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(ansiGreen)),
+		failure:   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(ansiRed)),
 		// UnderlineSpaces keeps the line continuous through a path with a
 		// space in it, which on macOS is most of them.
 		path: lipgloss.NewStyle().Underline(true).UnderlineSpaces(true),
 		doc:  lipgloss.NewStyle().Padding(1, 2),
 	}
 })
+
+// frame is a rounded box with one cell of padding inside it, its border in
+// the given ANSI colour. The three boxes the screens draw differ only in that
+// colour, so the geometry is written once and boxOverhead stays true of all
+// of them.
+func frame(colour string) lipgloss.Style {
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(colour)).
+		Padding(0, 1)
+}
+
+// boxOverhead is what a frame costs a line: one cell of border and one of
+// padding on each side. Text going into a box is cut or wrapped to the width
+// left after it, before the box is drawn, so the box wraps nothing itself.
+const boxOverhead = 4
 
 // styleBuilds counts how many times the set has been constructed. It is here
 // for the test that asserts package initialisation builds none: laziness is

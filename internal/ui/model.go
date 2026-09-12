@@ -59,6 +59,10 @@ type Model struct {
 	input textinput.Model
 	spin  spinner.Model
 	bar   progress.Model
+	// frame counts the spinner ticks the spinner has accepted. It is the
+	// clock the indeterminate bar sweeps on: one tick moves the spinner and
+	// the block together, so there is one animation clock, not two.
+	frame int
 
 	// hint is the inline complaint under the input box, e.g. for a URL that is
 	// not one. It is not an error state: nothing has been attempted yet.
@@ -131,7 +135,7 @@ func New(ctx context.Context, deps Deps, startURL string) Model {
 		state:    stateInput,
 		width:    defaultWidth,
 		input:    in,
-		spin:     spinner.New(spinner.WithSpinner(spinner.MiniDot)),
+		spin:     spinner.New(spinner.WithSpinner(spinner.Dot)),
 		bar:      newBar(),
 		startURL: startURL,
 	}
@@ -207,6 +211,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		var cmd tea.Cmd
 		m.spin, cmd = m.spin.Update(msg)
+		// The spinner answers a tick it accepted with the next one and a
+		// stale tick — from a chain an earlier attempt started — with
+		// nothing, so the command is the evidence that the frame moved.
+		if cmd != nil {
+			m.frame++
+		}
+		return m, cmd
+
+	case progress.FrameMsg:
+		// One step of the bar's spring. bubbles schedules these itself, only
+		// while the bar is still moving, and stops once it has arrived; off
+		// the download screen the step is dropped and the chain ends here.
+		if m.state != stateDownloading {
+			return m, nil
+		}
+		bar, cmd := m.bar.Update(msg)
+		m.bar = bar.(progress.Model)
+		// Re-targeting happens here, at frame cadence, not on the report:
+		// SetPercent drops the frame already scheduled (see the progressMsg
+		// case), and this is the one place a frame is known to have landed.
+		// The new frame it schedules replaces the one Update just made, so
+		// exactly one chain is alive after this either way.
+		if pct, known := m.prog.Percent(); known && pct/100 != m.bar.Percent() {
+			cmd = m.bar.SetPercent(pct / 100)
+		}
 		return m, cmd
 
 	case startURLMsg:
@@ -240,7 +269,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.prog, m.hasProg = msg.p, true
-		return m, waitProgress(m.progCh, msg.seq)
+		// A known percentage is handed to the bar's spring rather than drawn
+		// at once, so the bar slides between yt-dlp's reports instead of
+		// jumping. The label beside it still reads the report itself.
+		//
+		// The spring is only started here, never re-aimed: SetPercent bumps
+		// the bar's tag and schedules one 16 ms frame, and Update drops any
+		// frame carrying a stale tag. yt-dlp fires its hook per block and the
+		// pump delivers as fast as the loop drains, so reports often land
+		// closer together than a frame, and a SetPercent per report would
+		// invalidate every frame before it fired — the bar would stand still
+		// until the reports paused. The invariant kept instead is that
+		// IsAnimating() ⇒ a frame chain is alive: a stopped bar is kicked
+		// once, and a moving one is re-aimed by the FrameMsg handler.
+		var animate tea.Cmd
+		if pct, known := m.prog.Percent(); known && !m.bar.IsAnimating() {
+			animate = m.bar.SetPercent(pct / 100)
+		}
+		return m, tea.Batch(waitProgress(m.progCh, msg.seq), animate)
 
 	case progressClosedMsg:
 		// Download has closed the channel; the outcome arrives separately as a
@@ -624,6 +670,10 @@ func (m Model) startDownload(row ytdlp.Row) (tea.Model, tea.Cmd) {
 func (m *Model) launchDownload() tea.Cmd {
 	m.startAttempt()
 	m.progCh = make(chan ytdlp.Progress)
+	// A fresh bar, not SetPercent(0): the spring would animate down from
+	// wherever the last download left it, and a bar seen sliding back from
+	// full at the start of a download is a lie about this one.
+	m.bar = newBar()
 	return tea.Batch(
 		m.spin.Tick,
 		downloadCmd(m.runCtx, m.deps, m.seq, m.bin.Path, m.probe, m.row, m.progCh),
