@@ -39,6 +39,11 @@ type Deps struct {
 	// than a direct method call so a test can count the calls: the model owes
 	// exactly one per ProbeResult it accepted, on every path out.
 	Cleanup func(probe *ytdlp.ProbeResult) error
+
+	// Update is the background check for a newer yt-dlp, started once a
+	// session after Resolve returns the cached copy. It may be nil, and then
+	// no check is started.
+	Update func(ctx context.Context, res ytdlp.Result) (ytdlp.UpdateResult, error)
 }
 
 // Production is Deps wired to the real internal/ytdlp functions.
@@ -49,5 +54,6 @@ func Production() Deps {
 		Rank:     ytdlp.Rank,
 		Download: ytdlp.Download,
 		Cleanup:  (*ytdlp.ProbeResult).Cleanup,
+		Update:   ytdlp.BackgroundUpdate,
 	}
 }

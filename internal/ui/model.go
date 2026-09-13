@@ -114,6 +114,19 @@ type Model struct {
 	// motion is the animation on the input, download and done screens; see
 	// motion.go. Its zero value is switched off, which is what New builds.
 	motion motion
+
+	// updateStarted is set once the background yt-dlp check has been started,
+	// so a session starts at most one.
+	updateStarted bool
+	// updateRes is what the check reported: a release it staged, the newest
+	// release it or an earlier one knows of, which the error screen compares
+	// against the version in use, and a release that failed to install.
+	updateRes ytdlp.UpdateResult
+	// updateNotice is the faint line under the input screen's legend saying
+	// a newer yt-dlp was put in place by this launch's Resolve, or staged by
+	// the check for the next one. It is shown on the input screen and cleared
+	// when that screen is left.
+	updateNotice string
 }
 
 // New builds the model. ctx bounds the whole program: cancelling it cancels
@@ -315,6 +328,16 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case downloadDoneMsg:
 		return m.handleDownloaded(msg)
+
+	case updateDoneMsg:
+		// Whatever screen is up: the check changes no state, only what the
+		// input and error screens can say. An error is not shown anywhere;
+		// the result still carries a latest release a completed lookup found.
+		m.updateRes = msg.res
+		if notice := updateNotice(msg.res); notice != "" {
+			m.updateNotice = notice
+		}
+		return m, nil
 	}
 
 	if m.state == stateInput {
@@ -430,6 +453,7 @@ func (m Model) submit() (tea.Model, tea.Cmd) {
 	}
 
 	m.hint = ""
+	m.updateNotice = ""
 	m.url = target
 	m.state = stateProbing
 	m.firstRun = false
@@ -533,6 +557,8 @@ func (m Model) reset() Model {
 	// switched on, the seeded source, the intro already played, and the tick
 	// generation a stale tick has to be recognised against.
 	fresh.motion = m.motion
+	// So is the background check: it ran once and what it found still holds.
+	fresh.updateStarted, fresh.updateRes, fresh.updateNotice = m.updateStarted, m.updateRes, m.updateNotice
 	fresh.layout()
 	return fresh
 }
@@ -616,6 +642,21 @@ func (m Model) finishQuit() (tea.Model, tea.Cmd) {
 	return m, tea.Quit
 }
 
+// updateNotice is what the input screen says about a finished background
+// check, or "" for nothing. The check stages; it cannot put the release in
+// place while this yank is running the cached copy, so a staged release is
+// said to be for the next launch. The version is validated before the text is
+// built, so nothing a page or a binary made up is printed.
+func updateNotice(res ytdlp.UpdateResult) string {
+	switch {
+	case res.Status == ytdlp.UpdateStaged && ytdlp.ValidVersion(res.Staged):
+		return "yt-dlp " + res.Staged + " will be used next launch"
+	case res.Status == ytdlp.UpdateInstalled && ytdlp.ValidVersion(res.Version):
+		return "yt-dlp updated to " + res.Version
+	}
+	return ""
+}
+
 func (m Model) handleResolved(msg resolvedMsg) (tea.Model, tea.Cmd) {
 	if msg.seq != m.seq || m.state != stateProbing {
 		return m, nil
@@ -628,13 +669,26 @@ func (m Model) handleResolved(msg resolvedMsg) (tea.Model, tea.Cmd) {
 	}
 
 	m.bin, m.hasBin = msg.res, true
+	if msg.res.Updated && ytdlp.ValidVersion(msg.res.Version) {
+		// Resolve put a release staged by an earlier launch in place. Said
+		// on the input screen once the user is back on it.
+		m.updateNotice = "yt-dlp updated to " + msg.res.Version
+	}
 	m.step = stepFetchingInfo
 	m.firstRun = false
 	m.resolveCh = nil
 	// A second run on the same attempt, so it is counted here rather than in
 	// startAttempt: resolving and probing are two runs behind one spinner.
 	m.pending++
-	return m, probeCmd(m.runCtx, m.deps, m.seq, m.bin.Path, m.url, false)
+	probe := probeCmd(m.runCtx, m.deps, m.seq, m.bin.Path, m.url, false)
+	if m.bin.Source != ytdlp.SourceCache || m.updateStarted || m.deps.Update == nil {
+		return m, probe
+	}
+	// The background check starts beside the probe, never in front of it, on
+	// the program's context rather than the attempt's: esc ends an attempt,
+	// not the check.
+	m.updateStarted = true
+	return m, tea.Batch(probe, updateCmd(m.ctx, m.deps, m.bin))
 }
 
 func (m Model) handleProbed(msg probeDoneMsg) (tea.Model, tea.Cmd) {

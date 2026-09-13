@@ -20,6 +20,28 @@ by the OS is not evidence that the file is bad. The same distinction applies to
 the cached `-J` info-json and to a download the user cancelled: cancelled is not
 failed.
 
+**Never rename over the cached binary while a yank may be running it.** The
+zipapp is not safe to replace in place: CPython's zipimport reads the archive's
+directory once and then reopens the file *by path* for every module it loads,
+so a probe or download still running from `<cache>/yank/bin/yt-dlp` fails with
+a zipimport error the moment a rename puts a different archive there (the unix
+bundle re-execs itself by path, which has the same shape). An update therefore
+never touches the cached path: it verifies and probes into `yt-dlp.staged` with
+its own sidecar. Every yank takes a *shared* `flock` on `yt-dlp.lock` in
+`Resolve`, before anything execs the cached path, and holds it until exit; the
+lock file is opened read-only when it cannot be opened for writing. Only a
+caller that gets the lock *exclusively without waiting* — proof no other yank
+is running — may remove or rename over the cached copy: `promote` in
+`stage.go`, and `Resolve`'s repair of a stranded zipapp or a bad binary, which
+holds it from the discard until the fresh copy is installed. A first run, when
+nothing was cached, needs only the shared lock. A lock that cannot be taken or
+checked is inconclusive: keep every file, and a process that could not hold the
+shared lock never promotes or repairs for the rest of its life. Another yank
+holding the lock is reported as `ErrInUse`, and nothing else is. The staged copy
+is removed only on positive evidence (no sidecar, a sidecar that does not
+describe it, not newer than the cached copy, another asset kind), never because
+a lock or a rename failed.
+
 **Classifying a failed run.** Every helper that turns an `exec` outcome into an
 error must separate a *positive* failure — the process ran and refused — from an
 *inconclusive* one: the caller cancelled, our own timeout fired, a signal we did

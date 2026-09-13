@@ -56,6 +56,11 @@ type fakes struct {
 	downloads     []downloadOutcome
 
 	cleanupCalls int
+
+	updateCalls int
+	updateCtxs  []context.Context
+	updateRes   ytdlp.UpdateResult
+	updateErr   error
 }
 
 func (f *fakes) deps() Deps {
@@ -116,7 +121,20 @@ func (f *fakes) deps() Deps {
 			// itself is gone and not merely that the model meant to remove it.
 			return probe.Cleanup()
 		},
+		Update: func(ctx context.Context, res ytdlp.Result) (ytdlp.UpdateResult, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.updateCalls++
+			f.updateCtxs = append(f.updateCtxs, ctx)
+			return f.updateRes, f.updateErr
+		},
 	}
+}
+
+func (f *fakes) updates() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.updateCalls
 }
 
 // next picks the i-th outcome, repeating the last one past the end.

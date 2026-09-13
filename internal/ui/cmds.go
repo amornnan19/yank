@@ -26,6 +26,14 @@ type resolvedMsg struct {
 	err error
 }
 
+// updateDoneMsg reports the background yt-dlp check. It carries no seq: the
+// check belongs to the session, not to an attempt, and it is started at most
+// once.
+type updateDoneMsg struct {
+	res ytdlp.UpdateResult
+	err error
+}
+
 // probeDoneMsg reports one extraction. retry marks the second probe of a
 // stale-info retry, which lands in a different state and has an older
 // ProbeResult to clean up behind it.
@@ -112,6 +120,15 @@ func downloadCmd(ctx context.Context, deps Deps, seq int, ytdlpPath string, prob
 	return func() tea.Msg {
 		res, err := deps.Download(ctx, ytdlpPath, probe, row, updates)
 		return downloadDoneMsg{seq: seq, res: res, err: err}
+	}
+}
+
+// updateCmd runs the background check. It is not counted in pending: quit
+// does not wait on it, and Run cancels it once the loop has ended.
+func updateCmd(ctx context.Context, deps Deps, res ytdlp.Result) tea.Cmd {
+	return func() tea.Msg {
+		out, err := deps.Update(ctx, res)
+		return updateDoneMsg{res: out, err: err}
 	}
 }
 

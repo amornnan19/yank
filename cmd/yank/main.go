@@ -53,6 +53,8 @@ Usage:
 Flags:
   -h, --help          show this help and exit
       --version       print the version and exit
+      --update        update the cached yt-dlp to the latest release now,
+                      print what happened, and exit
 
 Downloads are saved to ~/Downloads, created if it is missing. When no home
 directory can be resolved, yank writes to the working directory and says so on
@@ -63,19 +65,24 @@ copy on first run and caches it under $XDG_CACHE_HOME/yank/bin, or
 ~/.cache/yank/bin when that is unset. ffmpeg is optional — without it, the
 merged and mp3 rows are hidden and the picker says so.
 
+The cached yt-dlp is kept up to date: at most once a day, in the background,
+yank checks for a newer release and downloads it for the next launch. A yt-dlp
+found on your PATH is never touched. Set YANK_NO_UPDATE=1 to switch the
+background check off; yank --update still works.
+
 Set YANK_DEBUG=1 to append a debug log to yank.log in that same cache
 directory, next to the cached binary.
 
-The interface needs a terminal. --help and --version work anywhere; starting
-the UI with stdout redirected is refused rather than writing escape codes into
-a pipe.
+The interface needs a terminal. --help, --version and --update work anywhere;
+starting the UI with stdout redirected is refused rather than writing escape
+codes into a pipe.
 `
 
 const notATerminal = `yank: stdout is not a terminal.
 
 The interface is a full-screen terminal UI, so redirecting it into a pipe or a
 file would produce escape codes and nothing you could read. Run yank in a
-terminal instead. --help and --version work anywhere.
+terminal instead. --help, --version and --update work anywhere.
 `
 
 // startUI enters the interface. It is a variable so the tests can drive run
@@ -84,6 +91,13 @@ terminal instead. --help and --version work anywhere.
 var startUI = func(ctx context.Context, url string, deps ui.Deps) error {
 	return ui.Run(ctx, deps, url)
 }
+
+// resolveForUpdate and updateCached are the two ytdlp calls --update makes.
+// Variables so a test can drive every outcome without the network.
+var (
+	resolveForUpdate = ytdlp.Resolve
+	updateCached     = ytdlp.Update
+)
 
 // stdoutIsTTY reports whether the interface has a terminal to draw on. A
 // variable so a test can state which case it is exercising instead of depending
@@ -116,6 +130,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// stderr and exits non-zero.
 	fs.Usage = func() {}
 	version := fs.Bool("version", false, "print the version and exit")
+	update := fs.Bool("update", false, "update the cached yt-dlp and exit")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -144,6 +159,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "yank: too many arguments: expected at most one URL, got %d\n\n", len(rest))
 		fmt.Fprint(stderr, usage)
 		return exitUsage
+	}
+
+	if *update {
+		if url != "" {
+			fmt.Fprintf(stderr, "yank: --update takes no URL\n\n")
+			fmt.Fprint(stderr, usage)
+			return exitUsage
+		}
+		return runUpdate(stdout, stderr)
 	}
 
 	if !stdoutIsTTY() {
@@ -216,6 +240,62 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "yank: %v\n", err)
 		return exitFailure
 	}
+}
+
+// runUpdate is yank --update: the check and the install, synchronously, with
+// no interface and no throttle, reported in one line.
+//
+// Its exit codes follow the ones above. Up to date, updated, downloaded and
+// staged for a later launch — whatever kept it from being switched in now —
+// and a yt-dlp on PATH that yank leaves alone all score 0; a failure scores
+// exitFailure with the reason on stderr. A cancel — ctrl+c, or a signal — scores what a signal
+// that shut the interface down scores, which is 0: the user asked yank to
+// stop and it stopped, leaving any cached copy exactly as it was. It is still
+// said on stderr, so a person at the terminal is not left guessing.
+func runUpdate(stdout, stderr io.Writer) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
+
+	res, err := resolveForUpdate(ctx)
+	if err == nil && res.Source == ytdlp.SourcePATH {
+		fmt.Fprintf(stdout, "yt-dlp is on your PATH (%s); update it with your package manager\n", res.Path)
+		return exitOK
+	}
+	var out ytdlp.UpdateResult
+	if err == nil {
+		out, err = updateCached(ctx, res)
+	}
+	switch {
+	case err != nil && ctx.Err() != nil:
+		// Classified by our own context, not by the error chain: an HTTP client
+		// timeout also satisfies errors.Is(context.DeadlineExceeded), and that
+		// is a failure, not the user stopping yank.
+		fmt.Fprintln(stderr, "yank: yt-dlp update cancelled")
+		return exitOK
+	case err != nil:
+		fmt.Fprintf(stderr, "yank: %v\n", err)
+		return exitFailure
+	case out.Status == ytdlp.UpdateInstalled:
+		fmt.Fprintf(stdout, "yt-dlp updated %s → %s\n", out.Previous, out.Version)
+	case out.Status == ytdlp.UpdateStaged && errors.Is(out.Kept, ytdlp.ErrInUse):
+		// Another yank is running the cached copy, and replacing it under a
+		// running yt-dlp can break it (#26). The staged release waits for the
+		// first launch that finds no other yank running.
+		fmt.Fprintf(stdout, "yt-dlp %s is downloaded and will be used once other yank windows close\n", out.Staged)
+	case out.Status == ytdlp.UpdateStaged && out.Kept != nil:
+		// Kept for any other reason — the lock cannot be held, the rename was
+		// refused, the cached copy's record does not describe it. Closing
+		// windows would not help, so the line does not say it would.
+		fmt.Fprintf(stdout, "yt-dlp %s is downloaded but could not be switched in: %v; yank will try again next launch\n", out.Staged, out.Kept)
+	case out.Status == ytdlp.UpdateStaged:
+		fmt.Fprintf(stdout, "yt-dlp %s is downloaded and will be used next launch\n", out.Staged)
+	case res.Updated:
+		// Resolve itself put an earlier staged release in place.
+		fmt.Fprintf(stdout, "yt-dlp updated to %s\n", out.Version)
+	default:
+		fmt.Fprintf(stdout, "yt-dlp is up to date (%s)\n", out.Version)
+	}
+	return exitOK
 }
 
 // setupDebugLog opens (creating as needed) <cache>/yank/yank.log for debug

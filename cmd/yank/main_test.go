@@ -14,6 +14,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/amornnan19/yank/internal/ui"
+	"github.com/amornnan19/yank/internal/ytdlp"
 )
 
 // call is what the interface was started with, or the fact that it was never
@@ -88,6 +89,8 @@ func TestHelpPrintsUsageToStdoutAndExitsZero(t *testing.T) {
 				"--version",
 				"~/Downloads",
 				"YANK_DEBUG=1",
+				"--update",
+				"YANK_NO_UPDATE",
 			} {
 				if !strings.Contains(stdout, want) {
 					t.Errorf("usage does not mention %q:\n%s", want, stdout)
@@ -260,7 +263,7 @@ func TestTheInterfaceGetsProductionDepsAndALiveContext(t *testing.T) {
 	}
 
 	d := started.deps
-	if d.Resolve == nil || d.Probe == nil || d.Rank == nil || d.Download == nil || d.Cleanup == nil {
+	if d.Resolve == nil || d.Probe == nil || d.Rank == nil || d.Download == nil || d.Cleanup == nil || d.Update == nil {
 		t.Fatalf("the interface was started with an incomplete Deps: %+v", d)
 	}
 	if started.ctxNil {
@@ -491,5 +494,212 @@ func TestSignalsCancelTheContextTheInterfaceRunsUnder(t *testing.T) {
 				t.Fatalf("%v did not cancel the context the interface was given", sig)
 			}
 		})
+	}
+}
+
+// --- yank --update ------------------------------------------------------------
+
+// updateHarness replaces the two ytdlp calls --update makes. The interface is
+// stubbed too, with a terminal that is not one, so a test that reached it
+// would fail on the refusal rather than pass by accident.
+func updateHarness(t *testing.T, resolve func(context.Context) (ytdlp.Result, error), update func(context.Context, ytdlp.Result) (ytdlp.UpdateResult, error)) *call {
+	t.Helper()
+	started := harness(t, false, nil)
+	oldResolve, oldUpdate := resolveForUpdate, updateCached
+	t.Cleanup(func() { resolveForUpdate, updateCached = oldResolve, oldUpdate })
+	resolveForUpdate, updateCached = resolve, update
+	return started
+}
+
+func cachedAt(version string) func(context.Context) (ytdlp.Result, error) {
+	return func(context.Context) (ytdlp.Result, error) {
+		return ytdlp.Result{Path: "/cache/yank/bin/yt-dlp", Version: version, Source: ytdlp.SourceCache}, nil
+	}
+}
+
+func TestUpdatePrintsOneLineAndExitsZero(t *testing.T) {
+	tests := []struct {
+		name    string
+		resolve func(context.Context) (ytdlp.Result, error)
+		result  ytdlp.UpdateResult
+		want    string
+		updates bool
+	}{
+		{
+			name:    "up to date",
+			resolve: cachedAt("2026.08.19"),
+			result:  ytdlp.UpdateResult{Status: ytdlp.UpdateUpToDate, Previous: "2026.08.19", Version: "2026.08.19", Latest: "2026.08.19"},
+			want:    "yt-dlp is up to date (2026.08.19)\n",
+			updates: true,
+		},
+		{
+			name:    "updated",
+			resolve: cachedAt("2026.07.01"),
+			result:  ytdlp.UpdateResult{Status: ytdlp.UpdateInstalled, Previous: "2026.07.01", Version: "2026.08.19", Latest: "2026.08.19"},
+			want:    "yt-dlp updated 2026.07.01 → 2026.08.19\n",
+			updates: true,
+		},
+		{
+			// Another yank is running the cached copy: the release waits.
+			name:    "staged while another yank runs",
+			resolve: cachedAt("2026.07.01"),
+			result:  ytdlp.UpdateResult{Status: ytdlp.UpdateStaged, Previous: "2026.07.01", Version: "2026.07.01", Staged: "2026.08.19", Latest: "2026.08.19", Kept: fmt.Errorf("wrapped: %w", ytdlp.ErrInUse)},
+			want:    "yt-dlp 2026.08.19 is downloaded and will be used once other yank windows close\n",
+			updates: true,
+		},
+		{
+			// Kept for a reason that is not another yank: closing windows
+			// would not help, so it is not what the line says.
+			name:    "staged, the switch refused",
+			resolve: cachedAt("2026.07.01"),
+			result:  ytdlp.UpdateResult{Status: ytdlp.UpdateStaged, Previous: "2026.07.01", Version: "2026.07.01", Staged: "2026.08.19", Latest: "2026.08.19", Kept: errors.New("could not replace /cache/yank/bin/yt-dlp: permission denied")},
+			want:    "yt-dlp 2026.08.19 is downloaded but could not be switched in: could not replace /cache/yank/bin/yt-dlp: permission denied; yank will try again next launch\n",
+			updates: true,
+		},
+		{
+			// Staged and nothing tried to switch it in.
+			name:    "staged, not tried",
+			resolve: cachedAt("2026.07.01"),
+			result:  ytdlp.UpdateResult{Status: ytdlp.UpdateStaged, Previous: "2026.07.01", Version: "2026.07.01", Staged: "2026.08.19", Latest: "2026.08.19"},
+			want:    "yt-dlp 2026.08.19 is downloaded and will be used next launch\n",
+			updates: true,
+		},
+		{
+			// Resolve put a release an earlier launch staged in place.
+			name: "promoted by Resolve",
+			resolve: func(context.Context) (ytdlp.Result, error) {
+				return ytdlp.Result{Path: "/cache/yank/bin/yt-dlp", Version: "2026.08.19", Source: ytdlp.SourceCache, Updated: true}, nil
+			},
+			result:  ytdlp.UpdateResult{Status: ytdlp.UpdateUpToDate, Previous: "2026.08.19", Version: "2026.08.19", Latest: "2026.08.19"},
+			want:    "yt-dlp updated to 2026.08.19\n",
+			updates: true,
+		},
+		{
+			name: "on PATH",
+			resolve: func(context.Context) (ytdlp.Result, error) {
+				return ytdlp.Result{Path: "/opt/homebrew/bin/yt-dlp", Version: "2026.08.19", Source: ytdlp.SourcePATH}, nil
+			},
+			want: "yt-dlp is on your PATH (/opt/homebrew/bin/yt-dlp); update it with your package manager\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			updated := false
+			started := updateHarness(t, tt.resolve, func(ctx context.Context, res ytdlp.Result) (ytdlp.UpdateResult, error) {
+				updated = true
+				if res.Source == ytdlp.SourcePATH {
+					t.Errorf("--update asked to update a PATH copy: %+v", res)
+				}
+				return tt.result, nil
+			})
+
+			code, stdout, stderr := exec(t, "--update")
+
+			if code != exitOK {
+				t.Fatalf("exited %d, want %d; stderr %q", code, exitOK, stderr)
+			}
+			if stdout != tt.want {
+				t.Errorf("stdout = %q, want %q", stdout, tt.want)
+			}
+			if stderr != "" {
+				t.Errorf("stderr = %q, want nothing", stderr)
+			}
+			if updated != tt.updates {
+				t.Errorf("update called = %t, want %t", updated, tt.updates)
+			}
+			if started.started {
+				t.Error("--update started the interface")
+			}
+		})
+	}
+}
+
+func TestUpdateFailureIsReportedOnStderr(t *testing.T) {
+	for name, calls := range map[string]struct {
+		resolve func(context.Context) (ytdlp.Result, error)
+		update  func(context.Context, ytdlp.Result) (ytdlp.UpdateResult, error)
+	}{
+		"resolve fails": {
+			resolve: func(context.Context) (ytdlp.Result, error) {
+				return ytdlp.Result{}, errors.New("could not fetch yt-dlp: GET x: unexpected status 404 Not Found")
+			},
+			update: func(context.Context, ytdlp.Result) (ytdlp.UpdateResult, error) {
+				t.Error("update ran after Resolve failed")
+				return ytdlp.UpdateResult{}, nil
+			},
+		},
+		"update fails": {
+			resolve: cachedAt("2026.07.01"),
+			update: func(context.Context, ytdlp.Result) (ytdlp.UpdateResult, error) {
+				return ytdlp.UpdateResult{Latest: "2026.08.19"}, errors.New("could not update yt-dlp to 2026.08.19: checksum mismatch")
+			},
+		},
+		// An HTTP client timeout satisfies errors.Is(context.DeadlineExceeded).
+		// Nobody pressed ctrl+c, so it is a failure, not a cancel.
+		"our own timeout": {
+			resolve: cachedAt("2026.07.01"),
+			update: func(context.Context, ytdlp.Result) (ytdlp.UpdateResult, error) {
+				return ytdlp.UpdateResult{}, fmt.Errorf("could not look up the latest yt-dlp release: %w", context.DeadlineExceeded)
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			updateHarness(t, calls.resolve, calls.update)
+
+			code, stdout, stderr := exec(t, "--update")
+
+			if code != exitFailure {
+				t.Fatalf("exited %d, want %d", code, exitFailure)
+			}
+			if stdout != "" {
+				t.Errorf("stdout = %q, want nothing", stdout)
+			}
+			if !strings.HasPrefix(stderr, "yank: could not") {
+				t.Errorf("stderr = %q, want the reason", stderr)
+			}
+		})
+	}
+}
+
+// ctrl+c during --update is the signal a terminal sends. It scores what a
+// signal that ends the interface scores.
+func TestACancelledUpdateExitsWithTheInterruptedCode(t *testing.T) {
+	updateHarness(t, cachedAt("2026.07.01"), func(ctx context.Context, res ytdlp.Result) (ytdlp.UpdateResult, error) {
+		self, err := os.FindProcess(os.Getpid())
+		if err != nil {
+			t.Skipf("cannot address this process to signal it: %v", err)
+		}
+		if err := self.Signal(os.Interrupt); err != nil {
+			t.Skipf("this platform cannot send itself an interrupt: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+			t.Error("the interrupt did not cancel the update's context")
+		}
+		return ytdlp.UpdateResult{}, fmt.Errorf("yt-dlp update cancelled: %w", ctx.Err())
+	})
+
+	code, stdout, stderr := exec(t, "--update")
+
+	if code != exitOK {
+		t.Fatalf("exited %d, want %d", code, exitOK)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want nothing", stdout)
+	}
+	if !strings.Contains(stderr, "cancelled") {
+		t.Errorf("stderr = %q, want the cancel said", stderr)
+	}
+}
+
+func TestUpdateTakesNoURL(t *testing.T) {
+	updateHarness(t, func(context.Context) (ytdlp.Result, error) {
+		t.Error("--update with a URL resolved yt-dlp")
+		return ytdlp.Result{}, nil
+	}, nil)
+
+	if code, _, stderr := exec(t, "--update", "https://example.com/v"); code != exitUsage {
+		t.Fatalf("exited %d, want %d; stderr %q", code, exitUsage, stderr)
 	}
 }

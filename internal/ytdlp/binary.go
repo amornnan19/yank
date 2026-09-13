@@ -53,6 +53,9 @@ type Result struct {
 	// HasFFmpeg reports whether ffmpeg was found on PATH. Its absence is not
 	// an error; callers are expected to degrade the feature set instead.
 	HasFFmpeg bool
+	// Updated reports that this call put a staged newer release in place of
+	// the cached copy before using it (#26), so Version is that release.
+	Updated bool
 }
 
 const (
@@ -95,6 +98,10 @@ const (
 
 // errNoChecksum reports that the checksum file did not list the wanted asset.
 var errNoChecksum = errors.New("asset not listed in " + checksumsAsset)
+
+// errChecksumMismatch reports a downloaded asset whose SHA-256 is not the one
+// the release's checksum file lists for it.
+var errChecksumMismatch = errors.New("checksum mismatch")
 
 // ResolveEvent is a milestone Resolve reports while it is still working, so a
 // UI can say what the wait is for instead of guessing from how long it has
@@ -151,6 +158,19 @@ func resolveWith(ctx context.Context, events chan<- ResolveEvent, timeout, delay
 	}
 	cached := filepath.Join(dir, binaryName(runtime.GOOS))
 
+	// The shared lock is taken before anything below can execute the cached
+	// path, and kept until the process exits (#26). A staged release is put in
+	// place first, and only when the lock can be had exclusively, which proves
+	// no other yank is running the cached copy; see lock.go and promote for
+	// how every other outcome keeps both files. Nothing here is a reason to
+	// fail Resolve except the caller cancelling the wait.
+	promoted := ""
+	if _, err := processLocks.withExclusive(ctx, cached, func() {
+		promoted, _, _ = promote(cached, os.Rename)
+	}); err != nil {
+		return Result{}, fmt.Errorf("could not fetch yt-dlp: %w", err)
+	}
+
 	// The cached copy was checksum-verified when it was installed and answered
 	// --version then. Running it again costs a full unpack of the PyInstaller
 	// bundle (~10s on darwin, measured in #16), so while the file is the same
@@ -192,6 +212,7 @@ func resolveWith(ctx context.Context, events chan<- ResolveEvent, timeout, delay
 	if statErr == nil && !stranded {
 		if version, ok := recordedVersion(rec, info); ok {
 			res.Path, res.Version, res.Source = cached, version, SourceCache
+			res.Updated = promoted != "" && version == promoted
 			return res, nil
 		}
 	}
@@ -207,6 +228,7 @@ func resolveWith(ctx context.Context, events chan<- ResolveEvent, timeout, delay
 				recordVersion(cached, info, version, rec.Asset)
 			}
 			res.Path, res.Version, res.Source = cached, version, SourceCache
+			res.Updated = promoted != "" && version == promoted
 			return res, nil
 		}
 		if err := ctx.Err(); err != nil {
@@ -221,10 +243,12 @@ func resolveWith(ctx context.Context, events chan<- ResolveEvent, timeout, delay
 	// to start it say nothing about a file that was checksum-verified when it
 	// was installed, and downloading over it would be the branch the cached
 	// artifacts rule forbids.
+	repair := false
 	switch {
 	case isMissing(statErr):
 		// Nothing is cached, so the download is a first run, not a
-		// replacement.
+		// replacement, and it needs no more than the shared lock; lock.go
+		// says why two first runs racing are safe.
 	case stranded:
 		// A discard without a probe, and the only one. The zipapp is an
 		// optimisation over the bundle, never a requirement, and a host that
@@ -235,38 +259,64 @@ func resolveWith(ctx context.Context, events chan<- ResolveEvent, timeout, delay
 		// not to have python3 (a GUI launcher, cron) downgrades a good zipapp
 		// to the bundle permanently, because the bundle's record is trusted
 		// on every run after that.
-		discardBinary(cached)
+		repair = true
 	case isBadBinary(probeErr):
 		// The file itself is at fault. That includes a zipapp whose python3
 		// has gone from PATH since the record was written: its shebang is
-		// #!/usr/bin/env python3, and env exits 127, a positive failure. The
-		// download's rename would replace it anyway; removing it now, with
-		// its sidecar, means a download that fails cannot leave a record
-		// describing a file it no longer matches.
-		discardBinary(cached)
+		// #!/usr/bin/env python3, and env exits 127, a positive failure.
+		repair = true
 	default:
 		// The probe error already names the path.
 		return Result{}, fmt.Errorf("could not use the cached yt-dlp (kept; retry, or delete it to force a fresh download): %w", probeErr)
 	}
 
-	// Sent once per Resolve, whatever the download below turns into: the
-	// zipapp-then-bundle retry is one wait from the user's point of view.
-	if events != nil {
-		select {
-		case events <- ResolveDownloading:
-		default:
+	install := func() (string, error) {
+		// Sent once per Resolve, whatever the download below turns into: the
+		// zipapp-then-bundle retry is one wait from the user's point of view.
+		if events != nil {
+			select {
+			case events <- ResolveDownloading:
+			default:
+			}
 		}
+		asset, zipapp := chooseAsset(ctx, runtime.GOARCH, env)
+		version, err := installAsset(ctx, base, asset, cached, timeout, delay)
+		if err != nil && zipapp && isBadBinary(err) {
+			// The zipapp started and refused: a python3 that answered --version
+			// but cannot run yt-dlp, say. installAsset has already removed it.
+			// The bundle needs no interpreter, so it gets the one retry this
+			// Resolve makes; a positive failure of the bundle is reported as it
+			// always was. Anything inconclusive was returned above untouched,
+			// because it says nothing about which asset is right.
+			version, err = installAsset(ctx, base, assetName(runtime.GOOS, runtime.GOARCH), cached, timeout, delay)
+		}
+		return version, err
 	}
-	asset, zipapp := chooseAsset(ctx, runtime.GOARCH, env)
-	version, err = installAsset(ctx, base, asset, cached, timeout, delay)
-	if err != nil && zipapp && isBadBinary(err) {
-		// The zipapp started and refused: a python3 that answered --version
-		// but cannot run yt-dlp, say. installAsset has already removed it. The
-		// bundle needs no interpreter, so it gets the one retry this Resolve
-		// makes; a positive failure of the bundle is reported as it always
-		// was. Anything inconclusive was returned above untouched, because it
-		// says nothing about which asset is right.
-		version, err = installAsset(ctx, base, assetName(runtime.GOOS, runtime.GOARCH), cached, timeout, delay)
+
+	if !repair {
+		version, err = install()
+	} else {
+		// A repair removes and replaces a file another yank may be running —
+		// a launch without python3 on PATH finds stranded the zipapp an
+		// interactive yank is downloading with — so it is made only under the
+		// exclusive lock, held from the discard until the fresh copy is
+		// installed. Anything else keeps the file: another yank holding the
+		// lock is not evidence the file is bad for it, and a process that
+		// cannot lock cannot know who else runs it. The discard goes before
+		// the download so one that fails cannot leave a record describing a
+		// file it no longer matches.
+		refused, lockErr := processLocks.withExclusive(ctx, cached, func() {
+			discardBinary(cached)
+			version, err = install()
+		})
+		switch {
+		case errors.Is(refused, ErrInUse):
+			return Result{}, fmt.Errorf("could not replace the cached yt-dlp (kept): %s: %w; close other yank windows and retry", cached, refused)
+		case refused != nil:
+			return Result{}, fmt.Errorf("could not replace the cached yt-dlp (kept; delete it to force a fresh download): %s: %w", cached, refused)
+		case err == nil && lockErr != nil:
+			return Result{}, fmt.Errorf("could not fetch yt-dlp: %w", lockErr)
+		}
 	}
 	if err != nil {
 		return Result{}, err
@@ -381,10 +431,16 @@ func recordVersion(binary string, info os.FileInfo, version, asset string) {
 	if err != nil {
 		return
 	}
-	dest := sidecarPath(binary)
-	// The prefix matches sweepStaleTemps's glob, so a temp file abandoned here
-	// is cleaned up by the same sweep as an abandoned download.
-	tmp, err := os.CreateTemp(filepath.Dir(dest), "yt-dlp-version-*")
+	writeAtomic(sidecarPath(binary), body, "yt-dlp-version-*")
+}
+
+// writeAtomic writes body to dest through a temp file in the same directory,
+// named by pattern, and a rename, so a reader never sees a half-written file.
+// It is best effort, for the small records kept beside the binary. pattern
+// must match sweepStaleTemps's glob, so a temp file abandoned here is cleaned
+// up by the same sweep as an abandoned download.
+func writeAtomic(dest string, body []byte, pattern string) {
+	tmp, err := os.CreateTemp(filepath.Dir(dest), pattern)
 	if err != nil {
 		return
 	}
@@ -792,47 +848,66 @@ func classifyProbe(path string, out []byte, runErr, callerCtxErr, probeCtxErr er
 func downloadFrom(ctx context.Context, base, asset, dest string) error {
 	client := &http.Client{Timeout: httpTimeout}
 
-	sums, err := fetch(ctx, client, base+checksumsAsset, maxChecksumsBytes)
+	tmpName, err := fetchVerified(ctx, client, base, asset, filepath.Dir(dest), "yt-dlp-*")
 	if err != nil {
 		return fmt.Errorf("could not fetch yt-dlp: %w", err)
 	}
-	want, err := parseChecksums(sums, asset)
-	if err != nil {
-		return fmt.Errorf("could not fetch yt-dlp: %w", err)
-	}
+	// Removed unless the rename below succeeds first.
+	defer os.Remove(tmpName)
 
-	dir := filepath.Dir(dest)
-	sweepStaleTemps(dir, staleTempAge)
-
-	tmp, err := os.CreateTemp(dir, "yt-dlp-*")
-	if err != nil {
-		return fmt.Errorf("could not fetch yt-dlp: %w", err)
-	}
-	tmpName := tmp.Name()
-	// Closed and removed unless the rename below succeeds first.
-	defer func() {
-		tmp.Close()
-		os.Remove(tmpName)
-	}()
-
-	got, err := fetchTo(ctx, client, base+asset, maxBinaryBytes, tmp)
-	if err != nil {
-		return fmt.Errorf("could not fetch yt-dlp: %w", err)
-	}
-	if got != want {
-		return fmt.Errorf("could not fetch yt-dlp: checksum mismatch for %s: got %s, want %s", asset, got, want)
-	}
-
-	if err := tmp.Chmod(0o755); err != nil {
-		return fmt.Errorf("could not fetch yt-dlp: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("could not fetch yt-dlp: %w", err)
-	}
 	if err := installVerified(ctx, tmpName, dest); err != nil {
 		return fmt.Errorf("could not fetch yt-dlp: %w", err)
 	}
 	return nil
+}
+
+// fetchVerified downloads the named release asset from base into a new temp
+// file in dir, named by pattern, and checks it against the release's
+// SHA2-256SUMS. On success the file is closed, executable, and the caller's to
+// move or remove; on any failure it has already been removed. pattern must
+// match sweepStaleTemps's glob, so a temp file a killed process abandons is
+// cleaned up by a later download.
+func fetchVerified(ctx context.Context, client *http.Client, base, asset, dir, pattern string) (string, error) {
+	sums, err := fetch(ctx, client, base+checksumsAsset, maxChecksumsBytes)
+	if err != nil {
+		return "", err
+	}
+	want, err := parseChecksums(sums, asset)
+	if err != nil {
+		return "", err
+	}
+
+	sweepStaleTemps(dir, staleTempAge)
+
+	tmp, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return "", err
+	}
+	tmpName := tmp.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			tmp.Close()
+			os.Remove(tmpName)
+		}
+	}()
+
+	got, err := fetchTo(ctx, client, base+asset, maxBinaryBytes, tmp)
+	if err != nil {
+		return "", err
+	}
+	if got != want {
+		return "", fmt.Errorf("%w for %s: got %s, want %s", errChecksumMismatch, asset, got, want)
+	}
+
+	if err := tmp.Chmod(0o755); err != nil {
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	ok = true
+	return tmpName, nil
 }
 
 // installVerified moves the verified temp file onto dest. It tolerates the one

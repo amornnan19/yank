@@ -53,7 +53,7 @@ func (m Model) screenBlock() (block string, reserve int, marks func(freeArea) []
 	case stateDone:
 		return m.header() + m.doneView(), m.doneRows(), nil
 	case stateError:
-		body = m.errorView()
+		return m.header() + m.errorView(), m.errorRows(), nil
 	default:
 		return m.header() + m.inputView(), m.inputRows(), nil
 	}
@@ -65,9 +65,32 @@ func (m Model) screenBlock() (block string, reserve int, marks func(freeArea) []
 // one. Centring on that height means neither of them moves the block when it
 // comes or goes. The animated screen has the same rows as the static one —
 // the painted wordmark is the drawing's own height — so this serves both.
+//
+// The update notice under the legend adds its row while it is shown. It is
+// not reserved when there is none: a notice arrives at most once a session,
+// and a row reserved on every launch for it would change where the block sits
+// on a terminal only just tall enough for the screen without it.
 func (m Model) inputRows() int {
-	m.state, m.quitting, m.hint = stateInput, false, " "
+	rows := m.inputRowsWithoutNotice()
+	if m.showUpdateNotice() {
+		rows++
+	}
+	return rows
+}
+
+// inputRowsWithoutNotice is inputRows before the update notice is counted.
+func (m Model) inputRowsWithoutNotice() int {
+	m.state, m.quitting, m.hint, m.updateNotice = stateInput, false, " ", ""
 	return lineCount(m.header() + m.inputView())
+}
+
+// showUpdateNotice reports whether the input screen draws the update notice:
+// there is one, and the screen with it — and with the line under the box —
+// is still shorter than the terminal, so it is centred with its reserve kept
+// and adds no row past the bottom. On a shorter terminal, or before the first
+// size is known, the notice is left out, as the site badge is.
+func (m Model) showUpdateNotice() bool {
+	return m.updateNotice != "" && m.height > 0 && m.inputRowsWithoutNotice()+1 < m.height
 }
 
 // doneRows is the rows the done screen reserves: the tallest the screen could
@@ -120,9 +143,14 @@ func (m Model) inputView() string {
 	return join(lines...) + "\n\n" + m.inputLegend()
 }
 
-// inputLegend is the input screen's key legend, animated or not.
+// inputLegend is the input screen's key legend, animated or not, with the
+// update notice under it when there is one.
 func (m Model) inputLegend() string {
-	return m.help("enter  fetch", "ctrl+c  quit")
+	legend := m.help("enter  fetch", "ctrl+c  quit")
+	if m.showUpdateNotice() {
+		legend += "\n" + fit(styles().faint, m.updateNotice, m.contentWidth())
+	}
+	return legend
 }
 
 // quittingView is what ctrl+c shows while the run it cancelled finishes dying.
@@ -634,12 +662,77 @@ const alreadyWorkingDirNote = "Your home directory could not be found, so yank l
 const alreadyNote = "This file was already there, so nothing was downloaded. Delete or rename it and pick again to fetch a fresh copy."
 
 func (m Model) errorView() string {
+	hint := m.newerYtDlpHint()
+	if hint != "" && !m.hintFits() {
+		hint = ""
+	}
+	return m.errorViewWith(hint)
+}
+
+// errorViewWith is the error screen with hint under the error, or without one
+// for "".
+func (m Model) errorViewWith(hint string) string {
 	cw := m.contentWidth()
-	return join(
-		fit(styles().failure, failedTitle, cw),
-		"",
-		m.errMsgView(),
-	) + "\n\n" + m.help("esc  back", "ctrl+c  quit")
+	lines := []string{fit(styles().failure, failedTitle, cw), "", m.errMsgView()}
+	if hint != "" {
+		lines = append(lines, "", styles().faint.Render(wrap(hint, cw)))
+	}
+	return join(lines...) + "\n\n" + m.help("esc  back", "ctrl+c  quit")
+}
+
+// errorRows is the rows the error screen reserves: the screen with the widest
+// hint newerYtDlpHint could produce, whenever one can still come. The hint
+// arrives with the background check, which may finish while the error screen
+// is up, and centring on the reserve means its arrival does not move the
+// block. A hint can come only in a session that started the check; any other
+// error screen reserves nothing and is centred on its own lines, as it was
+// before the hint existed. The condition never changes while the screen is up:
+// the check is started in handleResolved, before any probe or download can
+// fail.
+func (m Model) errorRows() int {
+	if !m.updateStarted {
+		return 0
+	}
+	return lineCount(m.header() + m.errorViewWith(hintFor(widestVersion)))
+}
+
+// hintFits reports whether the error screen draws the hint: the reserve, which
+// is at least as tall as the screen with any hint, is shorter than the
+// terminal, so the block is centred on it and ends inside the terminal. On a
+// shorter terminal, or before the first size is known, the hint is left out.
+func (m Model) hintFits() bool {
+	rows := m.errorRows()
+	return m.height > 0 && rows > 0 && rows < m.height
+}
+
+// widestVersion is the longest version ValidVersion accepts, for measuring.
+const widestVersion = "0000.00.00.000000000"
+
+// newerYtDlpHint is the line the error screen adds when a failed probe or
+// download ran on a yt-dlp older than the newest release a completed check
+// knows of, since a site change is the usual reason and a newer yt-dlp the
+// usual fix. There is none after a Resolve failure, which is not about
+// extractors and leaves no version in use to compare; none once this session
+// staged or installed the update, which the next launch uses; and none for a
+// release whose install failed, which running --update would only fail again.
+// Both versions are validated before the text is built, so nothing a page or a
+// binary made up is printed.
+func (m Model) newerYtDlpHint() string {
+	res := m.updateRes
+	switch {
+	case res.Status == ytdlp.UpdateInstalled, res.Status == ytdlp.UpdateStaged:
+		return ""
+	case res.Failed != "" && res.Failed == res.Latest:
+		return ""
+	case !ytdlp.NewerVersion(res.Latest, m.bin.Version):
+		return ""
+	}
+	return hintFor(res.Latest)
+}
+
+// hintFor is the newer-yt-dlp hint for version.
+func hintFor(version string) string {
+	return "a newer yt-dlp (" + version + ") is available — run yank --update"
 }
 
 // errMsgView is the error text, wrapped and framed in the failure colour. The
