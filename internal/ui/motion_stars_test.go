@@ -10,7 +10,7 @@ import (
 
 func TestStarfieldTwinklesOnWakesOnly(t *testing.T) {
 	r := rig(newStarfield)
-	r.mo.starRows = 8
+	r.mo.freeRows = 8
 	r.send(evShown)
 	if !r.effect().busy() {
 		t.Fatalf("shown, the starfield is not waiting for its first tick")

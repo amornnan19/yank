@@ -19,10 +19,18 @@ func (m Model) View() string {
 	if m.quitting {
 		return styles().doc.Render(m.header() + m.quittingView())
 	}
-	if m.motionShowing() {
-		// The input screen with motion, which is also what the probing screen
-		// looks like while the exit animation plays over it.
-		return styles().doc.Render(m.animatedInputView())
+	if s, ok := m.motionScreen(); ok {
+		switch s {
+		case screenInput:
+			// The input screen with motion, which is also what the probing
+			// screen looks like while the exit animation plays over it.
+			return styles().doc.Render(m.animatedInputView())
+		case screenDownloading:
+			// Also the done screen while the finish flash plays over it.
+			return styles().doc.Render(m.header() + m.animatedDownloadingView())
+		case screenDone:
+			return styles().doc.Render(m.header() + m.animatedDoneView())
+		}
 	}
 
 	var body string
@@ -96,9 +104,14 @@ func (m Model) probingView() string {
 // space, so the frame is the whole prefix; what it costs is measured on the
 // bare frame, never on the styled view.
 func (m Model) spinLine(style lipgloss.Style, text string) string {
+	return m.spinLineAt(style, text, m.contentWidth())
+}
+
+// spinLineAt is spinLine in w cells rather than the content width.
+func (m Model) spinLineAt(style lipgloss.Style, text string, w int) string {
 	spin := m.spin
 	spin.Style = style
-	return spin.View() + truncate(text, m.contentWidth()-lipgloss.Width(spin.Spinner.Frames[0]))
+	return spin.View() + truncate(text, w-lipgloss.Width(spin.Spinner.Frames[0]))
 }
 
 // statusLine says what the spinner is waiting for. Resolving gets two wordings:
@@ -330,20 +343,52 @@ func (m Model) downloadingView() string {
 		m.barLine(),
 	}
 
-	switch {
-	case m.retrying:
-		// The saved info-json's media URLs expired while the picker was up.
-		// Nothing has failed; a fresh extraction is on its way.
-		lines = append(lines, m.spinLine(styles().phase, retryingMessage))
-	case m.hasProg && m.prog.Phase == ytdlp.PhaseMerging:
-		lines = append(lines, m.spinLine(styles().phase, "merging video and audio…"))
-	case m.hasProg && m.prog.Phase == ytdlp.PhaseConverting:
-		lines = append(lines, m.spinLine(styles().phase, "converting audio…"))
-	default:
+	if text := m.underLine().text(); text != "" {
+		lines = append(lines, m.spinLine(styles().phase, text))
+	} else {
 		lines = append(lines, fit(styles().faint, m.statsLine(), cw))
 	}
 
 	return join(lines...) + "\n\n" + m.help("esc  cancel", "ctrl+c  quit")
+}
+
+// underLine is which line the download screen draws under the bar.
+type underLine int
+
+const (
+	lineStats underLine = iota
+	lineRetrying
+	lineMerging
+	lineConverting
+)
+
+// underLine is the line under the bar for the model as it is.
+func (m Model) underLine() underLine {
+	switch {
+	case m.retrying:
+		// The saved info-json's media URLs expired while the picker was up.
+		// Nothing has failed; a fresh extraction is on its way.
+		return lineRetrying
+	case m.hasProg && m.prog.Phase == ytdlp.PhaseMerging:
+		return lineMerging
+	case m.hasProg && m.prog.Phase == ytdlp.PhaseConverting:
+		return lineConverting
+	}
+	return lineStats
+}
+
+// text is the wording of a phase line, drawn beside the spinner, or "" for the
+// stats line, which is drawn from the report instead.
+func (l underLine) text() string {
+	switch l {
+	case lineRetrying:
+		return retryingMessage
+	case lineMerging:
+		return "merging video and audio…"
+	case lineConverting:
+		return "converting audio…"
+	}
+	return ""
 }
 
 // retryingMessage is the one line the stale-info retry shows. It says what
@@ -472,12 +517,7 @@ func (m Model) statsLine() string {
 
 func (m Model) doneView() string {
 	cw := m.contentWidth()
-	title := savedTitle
-	if m.result != nil && m.result.AlreadyExisted {
-		// yt-dlp skipped the download. "Saved" would read as "I just wrote
-		// this", and the file may be from an earlier pick of another format.
-		title = alreadyTitle
-	}
+	title := doneTitle(m.result != nil && m.result.AlreadyExisted)
 	lines := []string{fit(styles().success, title, cw), ""}
 	if m.result != nil {
 		lines = append(lines, m.pathView(m.result.Path))
@@ -519,6 +559,16 @@ func (m Model) pathView(path string) string {
 	cut := truncate(path, m.pathWidth()-boxOverhead)
 	inner := max(cw-boxOverhead, lipgloss.Width(cut))
 	return styles().savedBox.Width(inner + 2).Render(styles().path.Render(cut))
+}
+
+// doneTitle heads the done screen.
+func doneTitle(already bool) string {
+	if already {
+		// yt-dlp skipped the download. "Saved" would read as "I just wrote
+		// this", and the file may be from an earlier pick of another format.
+		return alreadyTitle
+	}
+	return savedTitle
 }
 
 // savedTitle and failedTitle head the two ending screens. The glyph carries

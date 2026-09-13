@@ -27,6 +27,13 @@ const longTitle = "Never Gonna Give You Up (Official Music Video) [Remastered 4K
 
 const longPath = "/Users/somebody/Downloads/Never Gonna Give You Up (Official Music Video) [Remastered 4K 60fps].mp4"
 
+// emojiTitle is a title a rune-by-rune width count gets wrong both ways: each
+// heart draws a cell wider than its runes count, each family four cells
+// narrower, and a cut between runes splits either.
+var emojiTitle = strings.Repeat("\u2764\ufe0f", 40) + " love you " + strings.Repeat("\U0001f468\u200d\U0001f469\u200d\U0001f467", 3) + " \U0001f1f9\U0001f1ed"
+
+var emojiPath = "/Users/somebody/Downloads/" + strings.Repeat("\u2764\ufe0f", 60) + " \U0001f468\u200d\U0001f469\u200d\U0001f467.mp4"
+
 func TestWindowSizeTruncatesALongTitle(t *testing.T) {
 	f := &fakes{probes: []probeOutcome{{probe: newProbe(t, longTitle, "Rick Astley")}}}
 	m := pickerModel(t, f, true, threeRows())
@@ -123,6 +130,7 @@ func screens(t *testing.T) map[string]Model {
 	out["probing"] = probing
 
 	out["picker"] = pickerModel(t, &fakes{probes: []probeOutcome{{probe: newProbe(t, longTitle, "Rick Astley")}}}, true, threeRows())
+	out["picker with an emoji title"] = pickerModel(t, &fakes{probes: []probeOutcome{{probe: newProbe(t, emojiTitle, "\u2764\ufe0f")}}}, true, threeRows())
 	out["picker without ffmpeg"] = pickerModel(t, &fakes{}, false, threeRows())
 	out["empty picker"] = pickerModel(t, &fakes{}, false, nil)
 
@@ -132,6 +140,8 @@ func screens(t *testing.T) map[string]Model {
 		Total: 64_000_000, TotalKnown: true, Speed: 3_200_000, SpeedKnown: true,
 	}})
 	out["downloading"] = downloading
+
+	out["downloading an emoji title"] = downloadingModel(t, &fakes{probes: []probeOutcome{{probe: newProbe(t, emojiTitle, "Uploader")}}})
 
 	merging := downloadingModel(t, &fakes{})
 	merging = send(merging, progressMsg{seq: merging.seq, p: ytdlp.Progress{
@@ -147,6 +157,10 @@ func screens(t *testing.T) map[string]Model {
 	done := downloadingModel(t, &fakes{})
 	done = send(done, downloadDoneMsg{seq: done.seq, res: &ytdlp.DownloadResult{Path: longPath, UsedWorkingDir: true}})
 	out["done"] = done
+
+	emojiDone := downloadingModel(t, &fakes{probes: []probeOutcome{{probe: newProbe(t, emojiTitle, "Uploader")}}})
+	emojiDone = send(emojiDone, downloadDoneMsg{seq: emojiDone.seq, res: &ytdlp.DownloadResult{Path: emojiPath, UsedWorkingDir: true}})
+	out["done with an emoji path"] = emojiDone
 
 	already := downloadingModel(t, &fakes{})
 	already = send(already, downloadDoneMsg{seq: already.seq, res: &ytdlp.DownloadResult{

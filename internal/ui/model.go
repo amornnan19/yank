@@ -111,8 +111,8 @@ type Model struct {
 	// quitting marks the window between ctrl+c and the program actually ending.
 	quitting bool
 
-	// motion is the input screen's animation; see motion.go. Its zero value
-	// is switched off, which is what New builds.
+	// motion is the animation on the input, download and done screens; see
+	// motion.go. Its zero value is switched off, which is what New builds.
 	motion motion
 }
 
@@ -182,22 +182,19 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(textinput.Blink, startURLCmd())
 }
 
-// Update is the whole state machine, with the input screen's motion kept in
-// step behind it: a motion tick is the clock and goes to the motion alone, and
-// every other message is handled by update and then shown to syncMotion, which
-// turns what it changed into motion events and keeps one tick outstanding at
-// most — none at all off the input screen.
+// Update is the whole state machine, with motion kept in step behind it: a
+// motion tick is the clock and goes to the motion alone, and every other
+// message is handled by update and then shown to syncMotion, which turns what
+// it changed into motion events and keeps one tick outstanding at most — none
+// at all on a screen without motion, or with nothing on it moving.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if tick, ok := msg.(motionTickMsg); ok {
 		return m.handleMotionTick(tick)
 	}
-	prevState, prevValue := m.state, m.input.Value()
-	key, isKey := msg.(tea.KeyMsg)
-	entered := isKey && key.Type == tea.KeyEnter
 	next, cmd := m.update(msg)
 	nm := next.(Model)
 	// Two statements, for the reason startDownload gives: syncMotion mutates nm.
-	motionCmd := nm.syncMotion(prevState, prevValue, entered)
+	motionCmd := nm.syncMotion(m, msg)
 	return nm, tea.Batch(cmd, motionCmd)
 }
 

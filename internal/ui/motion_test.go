@@ -5,7 +5,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/muesli/termenv"
 
 	"github.com/amornnan19/yank/internal/ytdlp"
 )
@@ -87,26 +90,42 @@ func runMotion(t *testing.T, m Model, until time.Duration, each func(Model)) Mod
 }
 
 // effectRig steps one effect outside a model, for the tests that watch an
-// effect's own states: what it paints, whether it is busy, when it wakes.
+// effect's own states: what it paints, whether it is busy, when it wakes. The
+// facts every event carries are the rig's fields, set by the test.
 type effectRig struct {
 	mo    motion
 	value string
+	dl    downloadFacts
+	done  doneFacts
 }
 
 func rig(build func() effect) *effectRig {
 	return &effectRig{mo: newMotionOf([]effect{build()}, 1)}
 }
 
+// on is the screen the rig's effect paints on.
+func (r *effectRig) on() screen {
+	s, _ := screenOf(r.effect())
+	return s
+}
+
 func (r *effectRig) send(kind motionEventKind) {
-	r.mo.broadcast(motionEvent{kind: kind}, r.value)
+	r.mo.broadcast(r.on(), motionEvent{kind: kind, value: r.value, dl: r.dl, done: r.done})
 }
 
 func (r *effectRig) tickAt(d time.Duration) {
 	r.mo.now = motionEpoch.Add(d)
-	r.mo.broadcast(motionEvent{kind: evTick}, r.value)
+	r.send(evTick)
 }
 
-func (r *effectRig) effect() effect { return r.mo.effects[0] }
+func (r *effectRig) effect() effect {
+	for _, effects := range r.mo.effects {
+		if len(effects) > 0 {
+			return effects[0]
+		}
+	}
+	return nil
+}
 
 func (r *effectRig) frame(cw int) inputFrame { return r.mo.frame(cw) }
 
@@ -200,8 +219,8 @@ func TestEveryOffSwitchDrawsTodaysStaticScreen(t *testing.T) {
 	}
 	// Each effect alone, and the whole registry, so an effect that forgot an
 	// off switch cannot hide behind the others.
-	sets := map[string][]func() effect{"all effects": effectRegistry}
-	for i, build := range effectRegistry {
+	sets := map[string][]func() effect{"all effects": effectRegistry[screenInput]}
+	for i, build := range effectRegistry[screenInput] {
 		sets["effect "+itoa(i)] = []func() effect{build}
 	}
 
@@ -276,7 +295,7 @@ func TestNoFrameTickIsPendingOnceEveryEffectIsIdle(t *testing.T) {
 	if m.motion.pending != tickWake {
 		t.Errorf("idle on the input screen the outstanding tick is %v, want one wake", m.motion.pending)
 	}
-	for i, e := range m.motion.effects {
+	for i, e := range m.motion.effects[screenInput] {
 		if e.busy() {
 			t.Errorf("effect %d (%T) is still busy at %v", i, e, clock(m))
 		}
@@ -435,8 +454,10 @@ func TestDoneEnterKeepsMotionOnTheFreshInputScreen(t *testing.T) {
 	m.motion = newMotion(noEnv, 1)
 	m = send(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = send(m, downloadDoneMsg{seq: m.seq, res: &ytdlp.DownloadResult{Path: "/x/a.mp4"}})
-	if m.motion.pending != tickNone {
-		t.Fatalf("the done screen has a %v motion tick outstanding", m.motion.pending)
+	// The done screen has motion of its own now; it plays out and stops.
+	m = runMotion(t, m, time.Hour, nil)
+	if m.state != stateDone || m.motion.pending != tickNone {
+		t.Fatalf("on the done screen, played out, a %v motion tick is outstanding", m.motion.pending)
 	}
 	gen := m.motion.gen
 	m = send(m, keyOf(tea.KeyEnter))
@@ -693,5 +714,547 @@ func TestMotionIsDeterministicForASeed(t *testing.T) {
 	}
 	if equalLines(a, c) {
 		t.Errorf("two different seeds drew identical frames; the randomness is not coming from the seed")
+	}
+}
+
+// --- the download and done screens ------------------------------------------
+
+func TestEveryEffectIsRegisteredOnTheScreenItPaints(t *testing.T) {
+	names := map[screen]string{screenInput: "input", screenDownloading: "download", screenDone: "done"}
+	for s, builds := range effectRegistry {
+		for i, build := range builds {
+			e := build()
+			got, ok := screenOf(e)
+			if !ok || got != screen(s) {
+				t.Errorf("%T is registered on the %s screen at %d but paints the %s screen (ok %v)", e, names[screen(s)], i, names[got], ok)
+			}
+		}
+	}
+	for s := range screenCount {
+		if len(newMotion(noEnv, 1).effects[s]) != len(effectRegistry[s]) {
+			t.Errorf("newMotion put %d effects on the %s screen, want its %d", len(newMotion(noEnv, 1).effects[s]), names[s], len(effectRegistry[s]))
+		}
+	}
+}
+
+// motionFor is the motion a test asks for: the whole registry under env, or
+// only the effects given.
+func motionFor(env func(string) (string, bool), effects []func() effect) motion {
+	if len(effects) == 0 || motionSwitchedOff(env) {
+		return newMotion(env, 1)
+	}
+	built := make([]effect, len(effects))
+	for i, build := range effects {
+		built[i] = build()
+	}
+	return newMotionOf(built, 1)
+}
+
+// downloadMotion is a model on the download screen for a video titled title,
+// at width × height, with the motion given switched on from the picker. The
+// commands the download started are not run: every test feeds the messages
+// it wants.
+func downloadMotion(t *testing.T, title string, width, height int, mo motion) (Model, *fakes) {
+	t.Helper()
+	f := &fakes{probes: []probeOutcome{{probe: newProbe(t, title, "Uploader")}}}
+	m := pickerModel(t, f, true, threeRows())
+	// The probing screen's first spinner tick races the probe's answer in
+	// pickerModel, so whether it landed differs run to run. A fresh spinner
+	// makes every run's frames the same.
+	m.spin, m.frame = spinner.New(spinner.WithSpinner(spinner.Dot)), 0
+	m.motion = mo
+	m = send(m, tea.WindowSizeMsg{Width: width, Height: height})
+	m = send(m, keyOf(tea.KeyEnter))
+	if m.state != stateDownloading {
+		t.Fatalf("enter on the picker went to %v", m.state)
+	}
+	// Download closes its channel before it returns. Closed here instead, so
+	// the drain a report reschedules answers at once without a command run.
+	close(m.progCh)
+	return m, f
+}
+
+// spinAt delivers the spinner's next tick as though it fired d past
+// motionEpoch.
+func spinAt(m Model, d time.Duration) Model {
+	tick := m.spin.Tick().(spinner.TickMsg)
+	tick.Time = motionEpoch.Add(d)
+	return send(m, tick)
+}
+
+// spinPeriod is the spinner's own period: spinner.Dot ticks at 10 fps.
+const spinPeriod = 100 * time.Millisecond
+
+// play delivers both clocks the download and done screens have, in time
+// order, the way the loop would: the spinner's tick every spinPeriod after
+// from while the model is on the download screen, and the motion tick whenever
+// one is outstanding. It stops at until. each, if not nil, sees the model
+// after every tick of either kind.
+func play(t *testing.T, m Model, from, until time.Duration, each func(Model)) Model {
+	t.Helper()
+	spin := from + spinPeriod
+	for range 100_000 {
+		spinning := m.state == stateDownloading && spin <= until
+		tick, ok := nextTick(m)
+		ticking := ok && tick.at.Sub(motionEpoch) <= until
+		switch {
+		case ticking && (!spinning || tick.at.Sub(motionEpoch) <= spin):
+			m = send(m, tick)
+		case spinning:
+			m = spinAt(m, spin)
+			spin += spinPeriod
+		default:
+			return m
+		}
+		if each != nil {
+			each(m)
+		}
+	}
+	t.Fatal("the clocks never reached their deadline")
+	return m
+}
+
+// speedReport is a downloading report for m at pct of a 64 MB total, at bps.
+func speedReport(m Model, pct int64, bps float64) progressMsg {
+	msg := report(m, pct)
+	msg.p.Speed, msg.p.SpeedKnown = bps, true
+	return msg
+}
+
+// springOnce feeds the bar the spring frames cmd scheduled, and nothing else
+// it produced: a motion tick in the batch carries the wall clock, which the
+// tests' clock is not.
+func springOnce(t *testing.T, m Model, cmd tea.Cmd) Model {
+	t.Helper()
+	for _, msg := range collect(t, cmd) {
+		if frame, ok := msg.(progress.FrameMsg); ok {
+			m = send(m, frame)
+		}
+	}
+	return m
+}
+
+// downloadScript runs a download through everything the download and done
+// screens show — reports that fill the bar and cross every quarter, a merge,
+// the stale-info retry and its fresh download, the finish — and then the done
+// screen for result, calling each for every model on the way.
+func downloadScript(t *testing.T, m Model, f *fakes, result ytdlp.DownloadResult, each func(name string, m Model)) Model {
+	t.Helper()
+	see := func(name string) func(Model) {
+		return func(m Model) { each(name+" at "+clock(m).String(), m) }
+	}
+	see("shown")(m)
+	at := time.Duration(0)
+	m = spinAt(m, at)
+	for i := int64(1); i <= 16; i++ {
+		var cmd tea.Cmd
+		m, cmd = step(m, speedReport(m, i*6, float64(1_000_000+(i%5)*400_000)))
+		see("report")(m)
+		if i%5 == 1 {
+			m = springOnce(t, m, cmd)
+		}
+		m = play(t, m, at, at+250*time.Millisecond, see("downloading"))
+		at += 250 * time.Millisecond
+	}
+	m = send(m, progressMsg{seq: m.seq, p: ytdlp.Progress{
+		Phase: ytdlp.PhaseMerging, Downloaded: 64_000_000, DownloadedKnown: true, Total: 64_000_000, TotalKnown: true,
+	}})
+	see("merging")(m)
+	m = play(t, m, at, at+700*time.Millisecond, see("merging"))
+	at += 700 * time.Millisecond
+
+	m = send(m, downloadDoneMsg{seq: m.seq, err: staleErr()})
+	see("retrying")(m)
+	m = play(t, m, at, at+700*time.Millisecond, see("retrying"))
+	at += 700 * time.Millisecond
+	m = send(m, probeDoneMsg{seq: m.seq, retry: true, probe: newProbe(t, m.info().Title, "Uploader")})
+	see("retried")(m)
+	m = send(m, speedReport(m, 100, 2_000_000))
+	m = play(t, m, at, at+700*time.Millisecond, see("retried"))
+	at += 700 * time.Millisecond
+
+	res := result
+	m = send(m, downloadDoneMsg{seq: m.seq, res: &res})
+	see("finished")(m)
+	return play(t, m, at, at+3*time.Second, see("done"))
+}
+
+func TestDownloadAndDoneOffSwitchesDrawTodaysStaticScreens(t *testing.T) {
+	type sw struct {
+		name          string
+		env           func(string) (string, bool)
+		width, height int
+	}
+	switches := []sw{
+		{"NO_COLOR", envWith("NO_COLOR", "1"), 80, 24},
+		{"YANK_NO_MOTION", envWith("YANK_NO_MOTION", "yes"), 80, 24},
+		{"too short for the download screen", noEnv, 80, 11},
+		{"too narrow for the layout", noEnv, 19, 24},
+	}
+	sets := map[string][]func() effect{}
+	var all []func() effect
+	for _, s := range []screen{screenDownloading, screenDone} {
+		for i, build := range effectRegistry[s] {
+			sets["screen "+itoa(int(s))+" effect "+itoa(i)] = []func() effect{build}
+			all = append(all, build)
+		}
+	}
+	sets["all effects"] = all
+
+	results := map[string]ytdlp.DownloadResult{
+		"saved":         {Path: longPath},
+		"already there": {Path: longPath, AlreadyExisted: true, UsedWorkingDir: true},
+	}
+	record := func(t *testing.T, mo motion, s sw, result ytdlp.DownloadResult) (views []string, ticked bool) {
+		m, f := downloadMotion(t, longTitle, s.width, s.height, mo)
+		downloadScript(t, m, f, result, func(_ string, m Model) {
+			views = append(views, m.View())
+			ticked = ticked || m.motion.pending != tickNone
+		})
+		return views, ticked
+	}
+	for _, s := range switches {
+		for rname, result := range results {
+			want, _ := record(t, motion{}, s, result)
+			for name, set := range sets {
+				got, ticked := record(t, motionFor(s.env, set), s, result)
+				if ticked {
+					t.Errorf("%s, %s, %s: a motion tick was scheduled", s.name, rname, name)
+				}
+				if len(got) != len(want) {
+					t.Errorf("%s, %s, %s: %d frames, want %d", s.name, rname, name, len(got), len(want))
+					continue
+				}
+				for i := range want {
+					if got[i] != want[i] {
+						t.Errorf("%s, %s, %s: frame %d differs from the static screen:\n%s\n--- want ---\n%s", s.name, rname, name, i, got[i], want[i])
+						break
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestEveryDownloadAndDoneFrameFitsTheTerminalAndThePalette(t *testing.T) {
+	trueColour(t)
+	titles := map[string]string{
+		"long title":    longTitle,
+		"short title":   "Me at the zoo",
+		"wide title":    strings.Repeat("日本語のタイトル", 8),
+		"hostile title": "evil\x1b]0;pwned\x07 title\nwith a newline and \x1b[31mred\x1b[0m " + longTitle,
+	}
+	results := map[string]ytdlp.DownloadResult{
+		"saved":         {Path: longPath},
+		"already there": {Path: longPath, AlreadyExisted: true, UsedWorkingDir: true},
+	}
+	for _, size := range [][2]int{{80, 24}, {120, 40}, {40, 24}, {24, 16}, {80, 12}} {
+		width, height := size[0], size[1]
+		for tname, title := range titles {
+			for rname, result := range results {
+				frames := 0
+				m, f := downloadMotion(t, title, width, height, newMotion(noEnv, 1))
+				m.bar = newBar(progress.WithColorProfile(termenv.TrueColor))
+				downloadScript(t, m, f, result, func(name string, m Model) {
+					if !m.motionShowing() {
+						return
+					}
+					frames++
+					view := m.View()
+					where := tname + ", " + rname + ", " + name + " at " + itoa(width) + "x" + itoa(height)
+					if !strings.ContainsRune(view, escape) {
+						t.Fatalf("%s rendered no escape sequence at TrueColor", where)
+					}
+					lines := strings.Split(view, "\n")
+					if len(lines) > height {
+						t.Errorf("%s is %d rows tall in a %d-row terminal:\n%s", where, len(lines), height, view)
+					}
+					for n, line := range lines {
+						assertLineIsPaletteSafe(t, where, width, n, line)
+					}
+				})
+				if frames < 40 {
+					t.Errorf("%s, %s at %dx%d: only %d frames showed motion; the script is not exercising the effects", tname, rname, width, height, frames)
+				}
+			}
+		}
+	}
+}
+
+func TestKeysActOnEveryFrameOfTheDownloadAndDoneMotion(t *testing.T) {
+	result := ytdlp.DownloadResult{Path: "/Users/x/Downloads/a.mp4"}
+	checked := map[state]int{}
+	m, f := downloadMotion(t, longTitle, 80, 30, newMotion(noEnv, 1))
+	downloadScript(t, m, f, result, func(name string, m Model) {
+		switch m.state {
+		case stateDownloading:
+			checked[m.state]++
+			esc, cmd := step(m, keyOf(tea.KeyEsc))
+			if esc.state != stateInput || esc.runCtx != nil {
+				t.Errorf("%s: esc went to %v with the attempt still live", name, esc.state)
+			}
+			if esc.motion.pending == tickNone {
+				t.Errorf("%s: esc left the input screen without its clock", name)
+			}
+			if cmd != nil && m.motion.pending == tickNone {
+				if _, ok := findMsg[motionTickMsg](collect(t, cmd)); !ok {
+					t.Errorf("%s: esc started no clock for the input screen", name)
+				}
+			}
+		case stateDone:
+			checked[m.state]++
+			if enter := send(m, keyOf(tea.KeyEnter)); enter.state != stateInput {
+				t.Errorf("%s: enter on the done screen went to %v", name, enter.state)
+			}
+			if _, cmd := step(m, runes("q")); !quitsNow(cmd) {
+				t.Errorf("%s: q on the done screen did not quit", name)
+			}
+			if _, cmd := step(m, keyOf(tea.KeyCtrlC)); !quitsNow(cmd) {
+				t.Errorf("%s: ctrl+c on the done screen did not quit", name)
+			}
+		}
+	})
+	if checked[stateDownloading] < 20 || checked[stateDone] < 20 {
+		t.Errorf("keys were tried on %d download frames and %d done frames; the script is not reaching them", checked[stateDownloading], checked[stateDone])
+	}
+}
+
+// burstStub is a download-screen burst: busy for 200ms from any report, and
+// with a wake it never asks the spinner's screen to honour.
+type burstStub struct {
+	cue  cue
+	last time.Time
+}
+
+func (e burstStub) step(ev motionEvent) effect {
+	switch ev.kind {
+	case evReport:
+		e.cue.arm()
+	case evLeft:
+		e = burstStub{}
+	case evTick:
+		e.cue.settle(ev.now)
+		e.last = ev.now
+	}
+	return e
+}
+
+func (e burstStub) busy() bool {
+	return e.cue.waiting || (e.cue.running && e.cue.elapsed(e.last) < 200*time.Millisecond)
+}
+
+func (e burstStub) wake() time.Time { return e.last.Add(time.Second) }
+
+func (e burstStub) paint(*downloadFrame) {}
+
+func TestTheDownloadScreenRunsNoMotionClockOfItsOwnWhileNothingBursts(t *testing.T) {
+	m, _ := downloadMotion(t, longTitle, 80, 24, newMotion(noEnv, 1))
+	if m.motion.pending != tickNone || !m.motionShowing() {
+		t.Fatalf("shown, the download screen has motion %v and a %v tick", m.motionShowing(), m.motion.pending)
+	}
+	// Reports, spinner ticks and a bar that springs: all of it on the clocks
+	// the screen already had.
+	for i := int64(1); i <= 20; i++ {
+		var cmd tea.Cmd
+		m, cmd = step(m, speedReport(m, i*4, 3_000_000))
+		for _, msg := range collect(t, cmd) {
+			if _, ok := msg.(motionTickMsg); ok {
+				t.Fatalf("report %d scheduled a motion tick", i)
+			}
+		}
+		m = spinAt(m, time.Duration(i)*spinPeriod)
+		if m.motion.pending != tickNone {
+			t.Fatalf("after report %d and a spinner tick a %v motion tick is outstanding", i, m.motion.pending)
+		}
+	}
+
+	// A burst runs the clock while it plays and stops it when it ends. The
+	// burst is a stub, so no real effect has to exist for this to hold.
+	m, _ = downloadMotion(t, longTitle, 80, 24, newMotionOf([]effect{burstStub{}}, 1))
+	m = spinAt(m, 0)
+	m = send(m, progressMsg{seq: m.seq, p: ytdlp.Progress{Phase: ytdlp.PhaseMerging, Downloaded: 1, DownloadedKnown: true}})
+	if m.motion.pending != tickFrame {
+		t.Fatalf("a burst started and no frame tick was scheduled")
+	}
+	start := clock(m)
+	m = play(t, m, start, start+time.Second, nil)
+	if m.motion.pending != tickNone {
+		t.Errorf("a second after the burst began a %v motion tick is still outstanding", m.motion.pending)
+	}
+
+	// Leaving mid-burst for a screen with no motion ends the chain; its tick
+	// is dropped.
+	m = send(m, progressMsg{seq: m.seq, p: ytdlp.Progress{Phase: ytdlp.PhaseConverting, Downloaded: 1, DownloadedKnown: true}})
+	stale, ok := nextTick(m)
+	if !ok {
+		t.Fatalf("the second burst scheduled nothing")
+	}
+	failed := send(m, downloadDoneMsg{seq: m.seq, err: hardErr()})
+	if failed.state != stateError || failed.motion.pending != tickNone {
+		t.Fatalf("a failure mid-burst went to %v with a %v tick outstanding", failed.state, failed.motion.pending)
+	}
+	if _, cmd := step(failed, stale); cmd != nil {
+		t.Errorf("the download screen's tick rescheduled itself on the error screen")
+	}
+
+	// esc mid-burst goes back to an input screen with nothing on it to move:
+	// the chain ends there too.
+	esc, cmd := step(m, keyOf(tea.KeyEsc))
+	if esc.state != stateInput || esc.motion.pending != tickNone {
+		t.Errorf("esc mid-burst went to %v with a %v tick outstanding", esc.state, esc.motion.pending)
+	}
+	if _, ok := findMsg[motionTickMsg](collect(t, cmd)); ok {
+		t.Errorf("esc mid-burst scheduled a motion tick")
+	}
+	if _, cmd := step(esc, stale); cmd != nil {
+		t.Errorf("the download screen's tick rescheduled itself on the input screen")
+	}
+}
+
+func TestTheDoneScreenStopsItsClockOnceEverythingHasPlayed(t *testing.T) {
+	for _, already := range []bool{false, true} {
+		m, _ := downloadMotion(t, "Me at the zoo", 80, 30, newMotion(noEnv, 1))
+		m = spinAt(m, 0)
+		m = send(m, downloadDoneMsg{seq: m.seq, res: &ytdlp.DownloadResult{Path: "/x/a.mp4", AlreadyExisted: already}})
+		if m.state != stateDone || m.result == nil {
+			t.Fatalf("the finished download is not on the done screen at once: %v", m.state)
+		}
+		m = play(t, m, 0, 10*time.Second, nil)
+		if m.motion.pending != tickNone {
+			t.Errorf("already %v: played out, the done screen has a %v tick outstanding at %v", already, m.motion.pending, clock(m))
+		}
+		if clock(m) > 3*time.Second {
+			t.Errorf("already %v: the done screen's clock ran until %v", already, clock(m))
+		}
+		static := m
+		static.motion.enabled = false
+		if m.View() != static.View() {
+			t.Errorf("already %v: played out, the done screen is not today's:\n%s\n--- want ---\n%s", already, m.View(), static.View())
+		}
+		// A resize that hides and brings back the screen does not play it again.
+		m = send(m, tea.WindowSizeMsg{Width: 80, Height: 6})
+		m = send(m, tea.WindowSizeMsg{Width: 80, Height: 30})
+		if m.motion.pending != tickNone {
+			t.Errorf("already %v: a resize replayed the done screen: a %v tick", already, m.motion.pending)
+		}
+	}
+
+	// Leaving mid-animation stops it.
+	m, _ := downloadMotion(t, "Me at the zoo", 80, 30, newMotion(noEnv, 1))
+	m = send(m, downloadDoneMsg{seq: m.seq, res: &ytdlp.DownloadResult{Path: "/x/a.mp4"}})
+	m = play(t, m, 0, 500*time.Millisecond, nil)
+	if m.motion.pending == tickNone {
+		t.Fatalf("half a second in, the done screen is not animating")
+	}
+	stale, _ := nextTick(m)
+	quit, cmd := step(m, runes("q"))
+	if !quitsNow(cmd) || quit.motion.pending != tickNone {
+		t.Errorf("q mid-animation: quits %v, a %v tick outstanding", quitsNow(cmd), quit.motion.pending)
+	}
+	if _, cmd := step(quit, stale); cmd != nil {
+		t.Errorf("a done-screen tick rescheduled itself after q")
+	}
+}
+
+// --- shared by the download and done effects' tests -------------------------
+
+// barFrame is a download frame whose bar is width cells with filled of them
+// filled.
+func barFrame(width, filled int) downloadFrame {
+	return downloadFrame{cw: width + 6, label: " 50%", bar: barCells(width, filled), filled: filled}
+}
+
+// litCells is the indices of a frame's bar cells not in the plain fill or
+// empty inks.
+func litCells(f downloadFrame) []int {
+	var lit []int
+	for i, c := range f.bar {
+		if c.ink != inkFill && c.ink != inkPlain {
+			lit = append(lit, i)
+		}
+	}
+	return lit
+}
+
+// equalInts reports whether two index lists are the same.
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// containsParam reports whether any of the SGR matches carries param.
+func containsParam(matches [][]string, param string) bool {
+	for _, m := range matches {
+		for _, p := range strings.Split(m[1], ";") {
+			if p == param {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// staticView is m's screen with motion off.
+func staticView(m Model) string {
+	m.motion.enabled = false
+	return m.View()
+}
+
+// holdStub holds the download screen for 100ms from the finish, like a flash.
+type holdStub struct{ burstStub }
+
+func (e holdStub) step(ev motionEvent) effect {
+	switch ev.kind {
+	case evFinish:
+		e.cue.arm()
+	case evShown, evLeft:
+		e = holdStub{}
+	case evTick:
+		e.cue.settle(ev.now)
+		e.last = ev.now
+		if e.cue.running && e.cue.elapsed(ev.now) >= 100*time.Millisecond {
+			e = holdStub{}
+		}
+	}
+	return e
+}
+
+func (e holdStub) busy() bool { return e.cue.live() }
+
+func (e holdStub) holds() bool { return e.cue.live() }
+
+// rowsStub records the free rows each event on the done screen carried.
+type rowsStub struct{ seen []int }
+
+func (e rowsStub) step(ev motionEvent) effect {
+	e.seen = append(append([]int(nil), e.seen...), ev.freeRows)
+	return e
+}
+
+func (e rowsStub) busy() bool { return false }
+
+func (e rowsStub) wake() time.Time { return time.Time{} }
+
+func (e rowsStub) paint(*doneFrame) {}
+
+func TestADoneScreenShownByTheEndOfAHoldKnowsItsFreeRows(t *testing.T) {
+	m, _ := downloadMotion(t, "Me at the zoo", 80, 30, newMotionOf([]effect{holdStub{}, rowsStub{}}, 1))
+	m = spinAt(m, 0)
+	m = send(m, downloadDoneMsg{seq: m.seq, res: &ytdlp.DownloadResult{Path: "/x/a.mp4"}})
+	if !m.motion.holding(screenDownloading) {
+		t.Fatalf("the stub is not holding the download screen")
+	}
+	m = play(t, m, 0, time.Second, nil)
+	want := m.starRowCount(m.header() + m.doneView())
+	seen := m.motion.effects[screenDone][0].(rowsStub).seen
+	if want < 1 || len(seen) == 0 || seen[len(seen)-1] != want {
+		t.Errorf("the done screen's effects saw free rows %v, want %d", seen, want)
 	}
 }

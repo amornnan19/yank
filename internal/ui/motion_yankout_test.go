@@ -83,6 +83,40 @@ func TestYankOutPullsTheURLOutOfTheBox(t *testing.T) {
 	}
 }
 
+func TestYankOutDropsWholeGraphemeClusters(t *testing.T) {
+	// A URL pasted with emoji in its path: a rune at a time, the families and
+	// hearts would come apart at the left edge as they went.
+	// The Devanagari and Bengali conjuncts are one cluster each to the
+	// segmenter lipgloss.Width uses; an older one drops the क् and leaves the
+	// ष standing alone.
+	const url = "https://example.com/\U0001f468\u200d\U0001f469\u200d\U0001f467\u2764\ufe0f\U0001f1f9\U0001f1ed\U0001f468\u200d\U0001f469\u200d\U0001f467\u2764\ufe0f\U0001f1f9\U0001f1ed" +
+		"/\u0915\u094d\u0937\u092e\u093e\u0928\u092e\u0938\u094d\u0924\u0947\u0995\u09cd\u09b7\u09b8\u09cd\u09a4\u09cb"
+	allowed := map[string]bool{ellipsis: true}
+	for _, c := range clustersOf(url) {
+		allowed[c] = true
+	}
+	for _, d := range yankDebris {
+		allowed[string(d)] = true
+	}
+	for _, cw := range []int{76, 26} {
+		r := rig(newYankOut)
+		r.value = url
+		r.send(evSubmit)
+		for at := time.Duration(0); at < yankDuration; at += motionFrame / 4 {
+			r.tickAt(at)
+			f := r.frame(cw)
+			if w := lipgloss.Width(f.boxText); w > f.boxWidth {
+				t.Errorf("at cw %d, %v the box text is %d cells, over %d", cw, at, w, f.boxWidth)
+			}
+			for _, c := range clustersOf(f.boxText) {
+				if !allowed[c] {
+					t.Fatalf("at cw %d, %v the box shows %q, which carries %q, a piece of a cluster", cw, at, f.boxText, c)
+				}
+			}
+		}
+	}
+}
+
 func TestTheExitShowsTheInputScreenThenTheProbingScreen(t *testing.T) {
 	f := &fakes{}
 	m := motionModel(t, f, 80, 24)
@@ -140,7 +174,7 @@ func TestEscMidExitReturnsToAWholeInputScreen(t *testing.T) {
 	if !strings.Contains(m.View(), url) {
 		t.Errorf("back on the input screen the box does not show the URL whole:\n%s", m.View())
 	}
-	if m.motion.holding() {
+	if m.motion.holding(screenInput) {
 		t.Errorf("the exit is still playing on the input screen")
 	}
 }
@@ -156,8 +190,8 @@ func TestAURLFromTheCommandLineSkipsTheExit(t *testing.T) {
 	if m.state != stateProbing {
 		t.Fatalf("the command line's URL went to %v", m.state)
 	}
-	if m.motion.holding() || m.motionShowing() || m.motion.pending != tickNone {
-		t.Errorf("launching with a URL played the exit: holding %v, pending %v", m.motion.holding(), m.motion.pending)
+	if m.motion.holding(screenInput) || m.motionShowing() || m.motion.pending != tickNone {
+		t.Errorf("launching with a URL played the exit: holding %v, pending %v", m.motion.holding(screenInput), m.motion.pending)
 	}
 	static := m
 	static.motion.enabled = false
@@ -170,7 +204,7 @@ func TestAURLFromTheCommandLineSkipsTheExit(t *testing.T) {
 	m.hasBin = true
 	m.input.SetValue(url)
 	m = send(m, keyOf(tea.KeyEnter))
-	if m.state != stateProbing || !m.motion.holding() || !m.motionShowing() {
-		t.Errorf("enter did not play the exit: state %v, holding %v", m.state, m.motion.holding())
+	if m.state != stateProbing || !m.motion.holding(screenInput) || !m.motionShowing() {
+		t.Errorf("enter did not play the exit: state %v, holding %v", m.state, m.motion.holding(screenInput))
 	}
 }

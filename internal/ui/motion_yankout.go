@@ -53,16 +53,21 @@ func (e yankOut) paint(f *inputFrame) {
 		return
 	}
 	// Sanitised before it is measured or cut, like every other line.
-	rs := []rune(sanitise(e.text))
+	// It drops away a grapheme cluster at a time: a rune at a time would leave
+	// the back half of an emoji on screen.
+	var cs []string
+	for c := range graphemes(sanitise(e.text)) {
+		cs = append(cs, c)
+	}
 	p := float64(e.cue.elapsed(f.now)) / float64(yankDuration)
-	shift := min(int(p*p*float64(len(rs)+1)), len(rs))
-	rest := rs[shift:]
+	shift := min(int(p*p*float64(len(cs)+1)), len(cs))
+	rest := cs[shift:]
 	if shift > 0 {
-		rest = append([]rune(nil), rest...)
+		rest = append([]string(nil), rest...)
 		for i := 0; i < len(yankDebris) && i < len(rest); i++ {
-			rest[i] = yankDebris[i]
+			rest[i] = string(yankDebris[i])
 		}
 	}
-	f.boxText = truncate(string(rest), f.boxWidth)
+	f.boxText = truncate(strings.Join(rest, ""), f.boxWidth)
 	f.boxTextSet = true
 }

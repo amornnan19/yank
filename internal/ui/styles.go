@@ -25,8 +25,10 @@ const (
 	ansiBlue   = "4"
 	ansiCyan   = "6"
 
-	// The bright half of the palette, slots 8-15, for the input screen's
-	// motion: the same sixteen colours the user's theme already tunes.
+	// The bright half of the palette, slots 8-15, for motion: the same
+	// sixteen colours the user's theme already tunes.
+	ansiBrightGreen = "10"
+	ansiBrightBlue  = "12"
 	ansiBrightCyan  = "14"
 	ansiBrightWhite = "15"
 )
@@ -39,8 +41,22 @@ type styleSet struct {
 	app lipgloss.Style
 
 	// bright is the highlight the input screen's motion passes over the
-	// wordmark: the shimmer band and the reveal sweep.
+	// wordmark — the shimmer band and the reveal sweep — and the core of the
+	// shine that crosses the progress bar.
 	bright lipgloss.Style
+
+	// barFill, barGlint, barFlash and barFlashDim draw the progress bar's
+	// cells on the animated download screen: the fill in the bar's own blue,
+	// one step brighter for the leading edge and the shine's flanks, and the
+	// finish flash in bright green settling to green.
+	barFill     lipgloss.Style
+	barGlint    lipgloss.Style
+	barFlash    lipgloss.Style
+	barFlashDim lipgloss.Style
+
+	// savedBorder is the done screen's box border on its own, for the frames in
+	// which it is still being traced.
+	savedBorder lipgloss.Style
 
 	// faint is for text that is there when wanted and out of the way when
 	// not: the help line, hints, the uploader.
@@ -122,6 +138,12 @@ var styles = sync.OnceValue(func() styleSet {
 		// space in it, which on macOS is most of them.
 		path: lipgloss.NewStyle().Underline(true).UnderlineSpaces(true),
 		doc:  lipgloss.NewStyle().Padding(1, 2),
+		// The animated download and done screens.
+		barFill:     lipgloss.NewStyle().Foreground(lipgloss.Color(ansiBlue)),
+		barGlint:    lipgloss.NewStyle().Foreground(lipgloss.Color(ansiBrightBlue)),
+		barFlash:    lipgloss.NewStyle().Foreground(lipgloss.Color(ansiBrightGreen)),
+		barFlashDim: lipgloss.NewStyle().Foreground(lipgloss.Color(ansiGreen)),
+		savedBorder: lipgloss.NewStyle().Foreground(lipgloss.Color(ansiGreen)),
 	}
 })
 

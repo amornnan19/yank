@@ -35,7 +35,7 @@ const (
 func newStarfield() effect { return starfield{} }
 
 func (e starfield) step(ev motionEvent) effect {
-	e.rows = ev.starRows
+	e.rows = ev.freeRows
 	switch ev.kind {
 	case evShown:
 		if !e.cue.live() {
