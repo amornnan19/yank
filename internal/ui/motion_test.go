@@ -1230,11 +1230,11 @@ func (e holdStub) busy() bool { return e.cue.live() }
 
 func (e holdStub) holds() bool { return e.cue.live() }
 
-// rowsStub records the free rows each event on the done screen carried.
+// rowsStub records the free cells each event on the done screen carried.
 type rowsStub struct{ seen []int }
 
 func (e rowsStub) step(ev motionEvent) effect {
-	e.seen = append(append([]int(nil), e.seen...), ev.freeRows)
+	e.seen = append(append([]int(nil), e.seen...), ev.freeCells)
 	return e
 }
 
@@ -1244,7 +1244,7 @@ func (e rowsStub) wake() time.Time { return time.Time{} }
 
 func (e rowsStub) paint(*doneFrame) {}
 
-func TestADoneScreenShownByTheEndOfAHoldKnowsItsFreeRows(t *testing.T) {
+func TestADoneScreenShownByTheEndOfAHoldKnowsItsFreeCells(t *testing.T) {
 	m, _ := downloadMotion(t, "Me at the zoo", 80, 30, newMotionOf([]effect{holdStub{}, rowsStub{}}, 1))
 	m = spinAt(m, 0)
 	m = send(m, downloadDoneMsg{seq: m.seq, res: &ytdlp.DownloadResult{Path: "/x/a.mp4"}})
@@ -1252,9 +1252,9 @@ func TestADoneScreenShownByTheEndOfAHoldKnowsItsFreeRows(t *testing.T) {
 		t.Fatalf("the stub is not holding the download screen")
 	}
 	m = play(t, m, 0, time.Second, nil)
-	want := m.starRowCount(m.header() + m.doneView())
+	want := m.freeArea(m.placement(m.header()+m.doneView(), m.doneRows())).cells()
 	seen := m.motion.effects[screenDone][0].(rowsStub).seen
 	if want < 1 || len(seen) == 0 || seen[len(seen)-1] != want {
-		t.Errorf("the done screen's effects saw free rows %v, want %d", seen, want)
+		t.Errorf("the done screen's effects saw free cells %v, want %d", seen, want)
 	}
 }

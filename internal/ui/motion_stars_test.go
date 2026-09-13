@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"strings"
 	"testing"
 	"time"
 
@@ -10,7 +9,7 @@ import (
 
 func TestStarfieldTwinklesOnWakesOnly(t *testing.T) {
 	r := rig(newStarfield)
-	r.mo.freeRows = 8
+	r.mo.freeCells = 8
 	r.send(evShown)
 	if !r.effect().busy() {
 		t.Fatalf("shown, the starfield is not waiting for its first tick")
@@ -46,49 +45,39 @@ func TestStarfieldTwinklesOnWakesOnly(t *testing.T) {
 	}
 }
 
-func TestStarsOnlyFallOnEmptyRowsTheTerminalHas(t *testing.T) {
-	for _, height := range []int{minWordmarkHeight, 14, 15, 16, 24, 50} {
-		m := motionModel(t, &fakes{}, 80, height, newStarfield)
-		static := testModel(t, &fakes{}, 80)
-		static = send(static, tea.WindowSizeMsg{Width: 80, Height: height})
-		staticLines := strings.Split(static.View(), "\n")
+func TestStarsOnlyFallOnEmptyCellsTheTerminalHas(t *testing.T) {
+	for _, size := range [][2]int{{80, minWordmarkHeight}, {80, 14}, {80, 15}, {80, 16}, {80, 24}, {80, 50}, {120, 40}, {200, 60}} {
+		width, height := size[0], size[1]
+		at := itoa(width) + "x" + itoa(height)
+		m := motionModel(t, &fakes{}, width, height, newStarfield)
+		static := testModel(t, &fakes{}, width)
+		static = send(static, tea.WindowSizeMsg{Width: width, Height: height})
+		reserve := static.inputRows()
 
-		seenStars := false
+		seen, seenBeside := 0, 0
 		m = runMotion(t, m, 20*time.Second, func(m Model) {
-			lines := strings.Split(m.View(), "\n")
-			if len(lines) > max(height, len(staticLines)) {
-				t.Fatalf("at height %d the starfield made the screen %d rows", height, len(lines))
-			}
-			// Every row the static screen uses — content and the padding
-			// above it — is drawn exactly as it is there; stars only ever
-			// arrive in rows past it, and never in the one under the legend.
-			content := len(staticLines) - 1
-			for i := 0; i < content && i < len(lines); i++ {
-				if lines[i] != staticLines[i] {
-					t.Fatalf("at height %d row %d changed:\n%q\nwant\n%q", height, i, lines[i], staticLines[i])
-				}
-			}
-			if len(lines) > content && strings.TrimSpace(lines[content]) != "" {
-				t.Fatalf("at height %d the row under the legend holds %q", height, lines[content])
-			}
-			if height >= len(staticLines)+3 && m.motion.now.Sub(motionEpoch) > 3*time.Second {
-				stars := 0
-				for _, line := range lines[content:] {
-					stars += strings.Count(line, "·") + strings.Count(line, "˙")
-				}
-				seenStars = seenStars || stars > 0
-			}
+			// Every cell the static screen draws is drawn exactly as it is
+			// there; stars only ever arrive clear of the block, its reserved
+			// row and its margin.
+			marks, beside := assertDecorationOnlyAround(t, "the starfield at "+at+" "+clock(m).String(),
+				static.View(), m.View(), width, height, reserve, "·˙")
+			seen += marks
+			seenBeside += beside
 		})
-		if height >= 16 && !seenStars {
-			t.Errorf("at height %d no star was ever drawn", height)
+		if height >= 16 && seen == 0 {
+			t.Errorf("at %s no star was ever drawn", at)
+		}
+		// Wider than the content, the margins beside the block are free too.
+		if width >= 120 && seenBeside == 0 {
+			t.Errorf("at %s no star was ever drawn beside the block", at)
 		}
 	}
 }
 
-func TestTheStarfieldSleepsWithNoRowToDrawIn(t *testing.T) {
+func TestTheStarfieldSleepsWithNoCellToDrawIn(t *testing.T) {
 	m := motionModel(t, &fakes{}, 80, minWordmarkHeight, newStarfield)
-	if n := strings.Count(m.View(), "\n") + 1; n < minWordmarkHeight {
-		t.Fatalf("the screen is %d rows at height %d; this test needs one with no spare row", n, minWordmarkHeight)
+	if n := m.motion.freeCells; n != 0 {
+		t.Fatalf("the screen leaves %d free cells at height %d; this test needs one with none", n, minWordmarkHeight)
 	}
 	m = runMotion(t, m, time.Minute, nil)
 	if m.motion.pending != tickNone {

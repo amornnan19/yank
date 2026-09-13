@@ -243,11 +243,11 @@ func TestTheSelectedRowIsTruncatedBeforeItIsStyled(t *testing.T) {
 	if !strings.HasSuffix(strings.TrimRight(selected, " "), "\x1b[0m") {
 		t.Errorf("the selected row does not end with a reset, so its style bleeds:\n%q", selected)
 	}
-	// Same visible width as its neighbour: a leading escape sequence eaten out
-	// of the truncation budget shortens the row it is on.
-	if lipgloss.Width(selected) != lipgloss.Width(unselected) {
-		t.Errorf("selected row is %d cells and its neighbour %d; the markers are the same width so the rows must be too\n%q\n%q",
-			lipgloss.Width(selected), lipgloss.Width(unselected), selected, unselected)
+	// The margin and the full content width: a leading escape sequence eaten
+	// out of the truncation budget shortens the row it is on. The row is
+	// padded to the content width before it is styled.
+	if got, want := lipgloss.Width(selected), m.marginLeft()+m.contentWidth(); got != want {
+		t.Errorf("selected row is %d cells, want the margin and the content width, %d\n%q", got, want, selected)
 	}
 }
 

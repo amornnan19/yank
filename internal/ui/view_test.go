@@ -380,11 +380,12 @@ func TestEveryOtherScreenRulesUnderItsHeader(t *testing.T) {
 	for name, m := range screens(t) {
 		m = send(m, tea.WindowSizeMsg{Width: 80, Height: 24})
 		lines := strings.Split(m.View(), "\n")
-		// Row 0 is the doc padding, row 1 the name, row 2 the rule.
-		if len(lines) < 3 {
+		// The block's first row is the name, and the one under it the rule.
+		first, _ := blockRows(m.View())
+		if first < 0 || len(lines) < first+2 {
 			t.Fatalf("%s rendered %d lines", name, len(lines))
 		}
-		rule := strings.TrimSpace(lines[2])
+		rule := strings.TrimSpace(lines[first+1])
 		if name == "input" {
 			// The box's own border is drawn with the same character, so the
 			// check is on the header rows alone.
@@ -393,8 +394,8 @@ func TestEveryOtherScreenRulesUnderItsHeader(t *testing.T) {
 			}
 			continue
 		}
-		if strings.TrimSpace(lines[1]) != appName {
-			t.Errorf("%s does not open on the one-line name: %q", name, lines[1])
+		if strings.TrimSpace(lines[first]) != appName {
+			t.Errorf("%s does not open on the one-line name: %q", name, lines[first])
 		}
 		if rule != strings.Repeat("─", m.contentWidth()) {
 			t.Errorf("%s has no rule the width of the content under its name: %q", name, rule)

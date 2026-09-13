@@ -150,8 +150,9 @@ const (
 	evEdit
 	// evSubmit is enter accepting a URL.
 	evSubmit
-	// evLayout is the free rows below the legend changing: a resize, or a
-	// hint or badge line coming or going. ev.freeRows is the new count.
+	// evLayout is the free space round the screen's block changing: a resize,
+	// or a screen whose block is a different size. ev.freeCells is the new
+	// count.
 	evLayout
 	// evReport is a progress report reaching the download screen.
 	evReport
@@ -175,9 +176,10 @@ type motionEvent struct {
 	// rng is the model's seeded source. Set on ticks only: randomness is
 	// drawn when a frame advances, never while one is painted.
 	rng *rand.Rand
-	// freeRows is how many rows below the legend the screen leaves empty, as
-	// the last layout measured it; zero or less is none.
-	freeRows int
+	// freeCells is how many cells round the screen's block the terminal
+	// leaves empty for decoration, as the last layout measured it — see
+	// freeArea; zero is none.
+	freeCells int
 	// dl is what the download screen is drawn from, and done what the done
 	// screen is. Both are set on every event, whatever the screen.
 	dl   downloadFacts
@@ -283,9 +285,9 @@ type motion struct {
 	due     time.Time
 	// now is the time of the latest tick accepted.
 	now time.Time
-	// freeRows is what every event carries as ev.freeRows: the rows the
-	// rendered screen left empty below the legend when it was last measured.
-	freeRows int
+	// freeCells is what every event carries as ev.freeCells: the free cells
+	// round the rendered screen's block when it was last measured.
+	freeCells int
 	// heldTitle is the title the download screen last showed. The finish
 	// flash holds that screen over the done screen, by which time the probe
 	// the title came from has been released.
@@ -340,7 +342,7 @@ func newMotionOf(effects []effect, seed uint64) motion {
 // rather than written in place: the Model this came from shares its backing
 // array.
 func (mo *motion) broadcast(s screen, ev motionEvent) {
-	ev.now, ev.freeRows = mo.now, mo.freeRows
+	ev.now, ev.freeCells = mo.now, mo.freeCells
 	if ev.kind == evTick {
 		ev.rng = rand.New(&mo.pcg)
 	}
@@ -458,7 +460,7 @@ func (m Model) handleMotionTick(msg motionTickMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if mo.screen != was {
-		m.measureFreeRows()
+		m.measureFreeCells()
 	}
 	cmd := m.scheduleMotion(true)
 	return m, cmd
@@ -485,24 +487,24 @@ func (m *Model) follow(reshow bool) bool {
 	return true
 }
 
-// measureFreeRows re-measures the rows the screen on show leaves below its
-// legend, and tells the screen's effects when that changed. The input
-// screen's count depends on the events just sent — they are what bring the
-// badge line — so it is measured after them; nothing a tick does on any
-// screen changes it.
-func (m *Model) measureFreeRows() {
+// measureFreeCells re-measures the free cells round the block of the screen on
+// show, and tells the screen's effects when that changed. It is measured after
+// the events just sent, from the block View would draw now; the rows a screen
+// reserves keep a hint or a badge line from changing it, and nothing a tick
+// does on any screen changes it.
+func (m *Model) measureFreeCells() {
 	mo := &m.motion
-	rows := 0
-	switch mo.screen {
-	case screenInput:
-		rows = m.starRowCount(m.animatedScreen(mo.frame(m.contentWidth())))
-	case screenDone:
-		rows = m.spareRows(m.header()+m.animatedDoneScreen(m.doneFrame())) - 1
-	}
-	if rows != mo.freeRows {
-		mo.freeRows = rows
+	cells := m.freeArea(m.placement(m.screenBlockSize())).cells()
+	if cells != mo.freeCells {
+		mo.freeCells = cells
 		mo.broadcast(mo.screen, m.motionEvent(evLayout))
 	}
+}
+
+// screenBlockSize is screenBlock without the marks, for measuring.
+func (m Model) screenBlockSize() (string, int) {
+	block, reserve, _ := m.screenBlock()
+	return block, reserve
 }
 
 // syncMotion runs after every message but a motion tick. It turns what the
@@ -564,7 +566,7 @@ func (m *Model) syncMotion(prev Model, msg tea.Msg) tea.Cmd {
 			}
 		}
 	}
-	m.measureFreeRows()
+	m.measureFreeCells()
 	return m.scheduleMotion(false)
 }
 
@@ -660,7 +662,7 @@ type cell struct {
 }
 
 // starMark is one star, in raw coordinates: View maps row and col onto the
-// empty rows the frame actually has, which only it knows.
+// free cells round the block, which only it knows.
 type starMark struct {
 	row, col int
 	glyph    rune
@@ -773,21 +775,13 @@ func (f inputFrame) wordmarkView() string {
 	return join(lines...)
 }
 
-// animatedInputView is the input screen with motion: the painted wordmark, the
-// box in the frame's border colour with the frame's placeholder or text, the
-// hint or the site badge under it, the legend, and the starfield in whatever
-// rows are left below. Under any off switch inputView draws the screen instead,
-// exactly as it was before motion existed.
-func (m Model) animatedInputView() string {
-	f := m.motion.frame(m.contentWidth())
-	screen := m.animatedScreen(f)
-	return screen + m.starRows(f.stars, screen)
-}
-
 // animatedScreen is the animated input screen down to the legend, without the
-// starfield. The badge is decoration: it is drawn only when the screen with it
-// still fits the terminal, so on one exactly as tall as the screen without it
-// the legend is not pushed off the bottom.
+// starfield. The badge is decoration: it is drawn only when the block with it
+// is centred by placement's own rule — the row under the box is part of the
+// reserve inputRows centres on, so the badge takes a row that is already kept
+// for it and pushes nothing off the bottom. The wordmark needs a terminal
+// taller than that block, so while motion shows this screen the badge always
+// has its row, and its fade never ticks with nothing on screen to fade.
 func (m Model) animatedScreen(f inputFrame) string {
 	cw := m.contentWidth()
 	in := m.input
@@ -808,7 +802,7 @@ func (m Model) animatedScreen(f inputFrame) string {
 	case f.badge != "":
 		style := lipgloss.NewStyle().Foreground(lipgloss.Color(f.badgeColour)).Faint(f.badgeFaint)
 		lines = append(lines, fit(style, f.badge, cw))
-		if m.spareRows(under()) < 0 {
+		if !m.placement(under(), m.inputRows()).centred {
 			lines = lines[:len(lines)-1]
 		}
 	}
@@ -822,47 +816,22 @@ func (m Model) spareRows(screen string) int {
 	return m.height - (strings.Count(screen, "\n") + 1) - 2
 }
 
-// starRowCount is how many rows below screen the starfield may draw in: the
-// spare rows less the blank one kept under the legend. Zero or less is none.
-func (m Model) starRowCount(screen string) int {
-	return m.spareRows(screen) - 1
-}
-
-// starRows is the starfield: the rows below the legend that the terminal has
-// and the screen does not use, one blank row left under the legend, the stars
-// mapped onto the rest. It never adds a row the terminal does not have, and
-// never touches a row that holds content.
-func (m Model) starRows(stars []starMark, screen string) string {
-	cw := m.contentWidth()
-	rows := m.starRowCount(screen)
-	if rows < 1 || len(stars) == 0 {
-		return ""
+// starMarks is the starfield drawn into the free space round the block: each
+// star's raw row and column picks one free cell, so every star is on a cell no
+// content holds and the stars spread over all the room there is — above the
+// block, below it, and beside it on a terminal wider than the content. With no
+// free cell there is no star.
+func starMarks(stars []starMark, a freeArea) []mark {
+	n := a.cells()
+	if n < 1 {
+		return nil
 	}
-	grid := make([][]rune, rows)
+	out := make([]mark, 0, len(stars))
 	for _, s := range stars {
-		r, c := mod(s.row, rows), mod(s.col, cw)
-		if grid[r] == nil {
-			grid[r] = []rune(strings.Repeat(" ", cw))
-		}
-		grid[r][c] = s.glyph
+		r, c := a.cell(mod(s.row<<16|s.col&0xffff, n))
+		out = append(out, mark{row: r, col: c, glyph: styles().faint.Render(string(s.glyph))})
 	}
-	out := make([]string, rows)
-	for i, row := range grid {
-		if row == nil {
-			continue
-		}
-		var b strings.Builder
-		last := len(strings.TrimRight(string(row), " "))
-		for _, r := range string(row)[:last] {
-			if r == ' ' {
-				b.WriteRune(' ')
-				continue
-			}
-			b.WriteString(styles().faint.Render(string(r)))
-		}
-		out[i] = b.String()
-	}
-	return "\n\n" + join(out...)
+	return out
 }
 
 // mod is n mod d, never negative.
@@ -1028,10 +997,10 @@ func (m Model) animatedUnderLine(f downloadFrame) string {
 
 // --- the done screen --------------------------------------------------------
 
-// confettiMark is one piece of confetti: y is how far down the free rows it is,
-// as a fraction of them, and col a raw column. View maps both onto the rows
-// and columns the screen actually has, which only it knows, and draws nothing
-// for a piece above or below them.
+// confettiMark is one piece of confetti: y is how far down the terminal it is,
+// as a fraction of its height, and col a raw column. View maps both onto the
+// cells the screen actually leaves free, which only it knows, and draws nothing
+// for a piece off the terminal or behind the block.
 type confettiMark struct {
 	y      float64
 	col    int
@@ -1075,15 +1044,6 @@ func (mo motion) paintDone(f doneFrame) doneFrame {
 		e.(donePainter).paint(&f)
 	}
 	return f
-}
-
-// animatedDoneView is the done screen with motion, and the confetti in
-// whatever rows are left below it. Under any off switch doneView draws the
-// screen instead, exactly as it was before motion existed.
-func (m Model) animatedDoneView() string {
-	f := m.doneFrame()
-	screen := m.animatedDoneScreen(f)
-	return screen + m.confettiRows(f.confetti, m.header()+screen)
 }
 
 // animatedDoneScreen is doneView drawn from the frame, down to the legend.
@@ -1165,44 +1125,21 @@ func traceBox(cut string, inner, cells int) string {
 	return join(top, middle, bottom)
 }
 
-// confettiRows is the confetti: the rows below the legend that the terminal
-// has and the screen does not use, one blank row left under the legend, the
-// pieces mapped onto the rest. Like the starfield it never adds a row the
-// terminal does not have, and never touches a row that holds content.
-func (m Model) confettiRows(pieces []confettiMark, screen string) string {
-	cw := m.contentWidth()
-	rows := m.starRowCount(screen)
-	if rows < 1 || len(pieces) == 0 {
-		return ""
-	}
-	grid := make([][]confettiMark, rows)
+// confettiMarks is the confetti drawn into the free space round the block. A
+// piece's y is a fraction of the terminal's height and its column is taken
+// modulo the width, so the burst falls down the whole terminal; a piece above
+// or below it, or on a cell the rectangle round the block keeps clear, is not
+// drawn — it passes behind the screen rather than over it.
+func confettiMarks(pieces []confettiMark, a freeArea) []mark {
+	var out []mark
 	for _, p := range pieces {
-		r := int(math.Floor(p.y * float64(rows)))
-		if r < 0 || r >= rows {
+		r := int(math.Floor(p.y * float64(a.height)))
+		c := mod(p.col, a.width)
+		if !a.free(r, c) {
 			continue
 		}
-		if grid[r] == nil {
-			grid[r] = make([]confettiMark, cw)
-		}
-		grid[r][mod(p.col, cw)] = p
+		style := lipgloss.NewStyle().Foreground(lipgloss.Color(p.colour))
+		out = append(out, mark{row: r, col: c, glyph: style.Render(string(p.glyph))})
 	}
-	out := make([]string, rows)
-	for i, row := range grid {
-		last := -1
-		for c, p := range row {
-			if p.glyph != 0 {
-				last = c
-			}
-		}
-		var b strings.Builder
-		for _, p := range row[:last+1] {
-			if p.glyph == 0 {
-				b.WriteRune(' ')
-				continue
-			}
-			b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(p.colour)).Render(string(p.glyph)))
-		}
-		out[i] = b.String()
-	}
-	return "\n\n" + join(out...)
+	return out
 }

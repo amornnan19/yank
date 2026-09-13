@@ -98,7 +98,8 @@ type styleSet struct {
 	// path is the saved file's path, the one thing the user came for.
 	path lipgloss.Style
 
-	// doc is the margin every screen sits in.
+	// doc is the margin a screen sits in when it is drawn top-left: before
+	// the terminal's size is known, or on one too small to centre it in.
 	doc lipgloss.Style
 }
 

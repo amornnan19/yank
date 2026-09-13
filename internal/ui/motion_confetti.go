@@ -39,13 +39,13 @@ var (
 func newConfetti() effect { return confetti{} }
 
 func (e confetti) step(ev motionEvent) effect {
-	e.rows = ev.freeRows
+	e.rows = ev.freeCells
 	switch ev.kind {
 	case evShown:
 		if e.seq == ev.done.seq && (e.played || e.cue.live()) {
 			break
 		}
-		e = confetti{seq: ev.done.seq, rows: ev.freeRows}
+		e = confetti{seq: ev.done.seq, rows: ev.freeCells}
 		if !ev.done.already {
 			e.cue.arm()
 		}

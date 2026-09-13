@@ -16,20 +16,29 @@ const appName = "yank"
 // View renders the current state. It is pure: no exec, no files, no clock. Any
 // work a screen needs has already happened in a tea.Cmd and landed in a field.
 func (m Model) View() string {
+	return m.place(m.screenBlock())
+}
+
+// screenBlock is the screen on show as a block, before placement: its lines,
+// the rows its screen reserves (see inputRows and doneRows), and the marks for
+// the free space around it on a screen that has any.
+func (m Model) screenBlock() (block string, reserve int, marks func(freeArea) []mark) {
 	if m.quitting {
-		return styles().doc.Render(m.header() + m.quittingView())
+		return m.header() + m.quittingView(), 0, nil
 	}
 	if s, ok := m.motionScreen(); ok {
 		switch s {
 		case screenInput:
 			// The input screen with motion, which is also what the probing
 			// screen looks like while the exit animation plays over it.
-			return styles().doc.Render(m.animatedInputView())
+			f := m.motion.frame(m.contentWidth())
+			return m.animatedScreen(f), m.inputRows(), func(a freeArea) []mark { return starMarks(f.stars, a) }
 		case screenDownloading:
 			// Also the done screen while the finish flash plays over it.
-			return styles().doc.Render(m.header() + m.animatedDownloadingView())
+			return m.header() + m.animatedDownloadingView(), 0, nil
 		case screenDone:
-			return styles().doc.Render(m.header() + m.animatedDoneView())
+			f := m.doneFrame()
+			return m.header() + m.animatedDoneScreen(f), m.doneRows(), func(a freeArea) []mark { return confettiMarks(f.confetti, a) }
 		}
 	}
 
@@ -42,13 +51,45 @@ func (m Model) View() string {
 	case stateDownloading:
 		body = m.downloadingView()
 	case stateDone:
-		body = m.doneView()
+		return m.header() + m.doneView(), m.doneRows(), nil
 	case stateError:
 		body = m.errorView()
 	default:
-		body = m.inputView()
+		return m.header() + m.inputView(), m.inputRows(), nil
 	}
-	return styles().doc.Render(m.header() + body)
+	return m.header() + body, 0, nil
+}
+
+// inputRows is the rows the input screen reserves: the screen with the line
+// under the box drawn, which holds the hint or the site badge when there is
+// one. Centring on that height means neither of them moves the block when it
+// comes or goes. The animated screen has the same rows as the static one —
+// the painted wordmark is the drawing's own height — so this serves both.
+func (m Model) inputRows() int {
+	m.state, m.quitting, m.hint = stateInput, false, " "
+	return lineCount(m.header() + m.inputView())
+}
+
+// doneRows is the rows the done screen reserves: the tallest the screen could
+// be for this path, with the already-there note and the working-directory note
+// both drawn. Which notes show depends on the outcome, and an outcome with
+// fewer of them sits where one with all of them would, so the title and the
+// path stay on the same rows whichever it was — on a terminal taller than the
+// reserve. On one as short as it or shorter, placement centres each outcome on
+// its own lines, so the rows differ between outcomes but a screen that fits is
+// still centred, with free space round it for the confetti.
+func (m Model) doneRows() int {
+	if m.result == nil {
+		return 0
+	}
+	rows := 0
+	for _, already := range []bool{false, true} {
+		res := *m.result
+		res.AlreadyExisted, res.UsedWorkingDir = already, true
+		m.result = &res
+		rows = max(rows, lineCount(m.header()+m.doneView()))
+	}
+	return rows
 }
 
 // header is what stands above the body. An input screen with room for it opens

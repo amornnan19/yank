@@ -44,13 +44,31 @@ func (m Model) contentWidth() int {
 // pathWidth is how wide a file path may be. Unlike prose, a path is not capped
 // at maxContentWidth: the done screen exists to hand the user that path, and
 // cutting it short in a terminal wide enough to hold it makes it useless for
-// the one thing it is for.
+// the one thing it is for. It runs from the block's left edge to the doc
+// style's right margin, so a path wider than the content still fits the
+// terminal on a centred screen.
+//
+// The edge is marginLeft's, which depends on the width alone. On a terminal
+// wider than 100 columns and too short to centre the done screen, the block is
+// drawn at the doc margin but the path keeps the centred budget: a few cells
+// shorter than the terminal would hold, and never wider than it.
 func (m Model) pathWidth() int {
 	w := m.width
 	if w <= 0 {
 		w = defaultWidth
 	}
-	return max(w-4, minContentWidth)
+	return max(w-m.marginLeft()-marginCols, minContentWidth)
+}
+
+// marginLeft is the column a centred block starts at: the content width
+// centred in the terminal, or the doc style's margin when the terminal is not
+// wider than the content and its margins, or its width is not yet known.
+func (m Model) marginLeft() int {
+	cw := m.contentWidth()
+	if m.width < cw+2*marginCols {
+		return marginCols
+	}
+	return (m.width - cw) / 2
 }
 
 // layout resizes the sub-models to the current terminal. Called on every

@@ -12,7 +12,7 @@ import (
 
 func TestConfettiFallsOnceOnSavedOnly(t *testing.T) {
 	already := rig(newConfetti)
-	already.mo.freeRows = 8
+	already.mo.freeCells = 8
 	already.done = doneFacts{seq: 1, already: true}
 	already.send(evShown)
 	if !already.idle() {
@@ -20,7 +20,7 @@ func TestConfettiFallsOnceOnSavedOnly(t *testing.T) {
 	}
 
 	r := rig(newConfetti)
-	r.mo.freeRows = 8
+	r.mo.freeCells = 8
 	r.done = doneFacts{seq: 1}
 	r.send(evShown)
 	if !r.effect().busy() {
@@ -71,7 +71,7 @@ func TestConfettiFallsOnceOnSavedOnly(t *testing.T) {
 	// The seed decides the burst.
 	burst := func(seed uint64) []confettiMark {
 		r := &effectRig{mo: newMotionOf([]effect{newConfetti()}, seed), done: doneFacts{seq: 1}}
-		r.mo.freeRows = 8
+		r.mo.freeCells = 8
 		r.send(evShown)
 		r.tickAt(0)
 		return r.mo.paintDone(doneFrame{}).confetti
@@ -103,53 +103,83 @@ func equalMarks(a, b []confettiMark) bool {
 	return true
 }
 
-func TestConfettiOnlyFallsThroughEmptyRowsTheTerminalHas(t *testing.T) {
+func TestConfettiOnlyFallsThroughEmptyCellsTheTerminalHas(t *testing.T) {
 	trueColour(t)
-	for _, height := range []int{12, 14, 16, 24, 40} {
-		m, _ := downloadMotion(t, "Me at the zoo", 80, height, newMotionOf([]effect{newConfetti()}, 1))
+	for _, size := range [][2]int{{80, 12}, {80, 14}, {80, 16}, {80, 24}, {80, 40}, {120, 40}, {200, 60}} {
+		width, height := size[0], size[1]
+		at := itoa(width) + "x" + itoa(height)
+		m, _ := downloadMotion(t, "Me at the zoo", width, height, newMotionOf([]effect{newConfetti()}, 1))
 		res := &ytdlp.DownloadResult{Path: "/Users/x/Downloads/Me at the zoo.mp4"}
 		m = send(m, downloadDoneMsg{seq: m.seq, res: res})
-		staticLines := strings.Split(staticView(m), "\n")
-		content := len(staticLines) - 1
-		midFall := false
+		static := staticView(m)
+		// The rows kept clear: the reserve where the terminal is taller than
+		// it, and the block's own lines where it is not.
+		reserve := m.placement(m.screenBlockSize()).rows
+		seen, seenBeside := 0, 0
 		m = play(t, m, 0, 3*time.Second, func(m Model) {
 			view := m.View()
-			lines := strings.Split(view, "\n")
-			if len(lines) > max(height, len(staticLines)) {
-				t.Fatalf("at height %d the confetti made the screen %d rows", height, len(lines))
+			for n, line := range strings.Split(view, "\n") {
+				assertLineIsPaletteSafe(t, "confetti at "+clock(m).String(), width, n, line)
 			}
-			for i := 0; i < content && i < len(lines); i++ {
-				if lines[i] != staticLines[i] {
-					t.Fatalf("at height %d row %d changed:\n%q\nwant\n%q", height, i, lines[i], staticLines[i])
-				}
-			}
-			if len(lines) > content && strings.TrimSpace(lines[content]) != "" {
-				t.Fatalf("at height %d the row under the legend holds %q", height, lines[content])
-			}
-			for n, line := range lines {
-				assertLineIsPaletteSafe(t, "confetti at "+clock(m).String(), 80, n, line)
-			}
-			pieces := 0
-			for _, line := range lines[min(content+1, len(lines)):] {
-				pieces += len(strings.TrimSpace(sgr.ReplaceAllString(line, "")))
-			}
-			midFall = midFall || pieces > 0
+			marks, beside := assertDecorationOnlyAround(t, "the confetti at "+at+" "+clock(m).String(),
+				static, view, width, height, reserve, string(confettiGlyphs))
+			seen += marks
+			seenBeside += beside
 		})
-		if room := height - len(staticLines); room >= 3 && !midFall {
-			t.Errorf("at height %d no confetti was ever drawn", height)
+		if first, last := blockRows(static); height-(last-first+1) >= 8 && seen == 0 {
+			t.Errorf("at %s no confetti was ever drawn", at)
+		}
+		if width >= 120 && seenBeside == 0 {
+			t.Errorf("at %s no confetti was ever drawn beside the block", at)
 		}
 		if m.motion.pending != tickNone {
-			t.Errorf("at height %d the confetti left a %v tick", height, m.motion.pending)
+			t.Errorf("at %s the confetti left a %v tick", at, m.motion.pending)
 		}
 		// enter and q act mid-fall.
-		m, _ = downloadMotion(t, "Me at the zoo", 80, height, newMotionOf([]effect{newConfetti()}, 1))
+		m, _ = downloadMotion(t, "Me at the zoo", width, height, newMotionOf([]effect{newConfetti()}, 1))
 		m = send(m, downloadDoneMsg{seq: m.seq, res: res})
 		m = play(t, m, 0, 600*time.Millisecond, nil)
 		if enter := send(m, keyOf(tea.KeyEnter)); enter.state != stateInput {
-			t.Errorf("at height %d enter mid-fall went to %v", height, enter.state)
+			t.Errorf("at %s enter mid-fall went to %v", at, enter.state)
 		}
 		if _, cmd := step(m, runes("q")); !quitsNow(cmd) {
-			t.Errorf("at height %d q mid-fall did not quit", height)
+			t.Errorf("at %s q mid-fall did not quit", at)
+		}
+	}
+}
+
+func TestConfettiPlaysOnATerminalShorterThanTheDoneScreenReserves(t *testing.T) {
+	trueColour(t)
+	for _, size := range [][2]int{{80, 16}, {21, 24}} {
+		width, height := size[0], size[1]
+		at := itoa(width) + "x" + itoa(height)
+		m, _ := downloadMotion(t, "Me at the zoo", width, height, newMotionOf([]effect{newConfetti()}, 1))
+		res := &ytdlp.DownloadResult{Path: "/Users/x/Downloads/Me at the zoo.mp4"}
+		m = send(m, downloadDoneMsg{seq: m.seq, res: res})
+
+		// The terminal is too short for the tallest done screen, but not for
+		// this one: the case the reserve must not push out of centring.
+		static := staticView(m)
+		block, reserve, _ := m.screenBlock()
+		if reserve < height || lineCount(block) >= height {
+			t.Fatalf("at %s the block is %d rows and reserves %d: not a screen that fits under a reserve that does not", at, lineCount(block), reserve)
+		}
+		p := m.placement(block, reserve)
+		if !p.centred {
+			t.Errorf("at %s a %d-row Saved screen is drawn top-left", at, lineCount(block))
+		}
+		if n := m.freeArea(p).cells(); n < 1 {
+			t.Errorf("at %s a centred Saved screen leaves %d free cells", at, n)
+		}
+
+		seen := 0
+		play(t, m, 0, 3*time.Second, func(m Model) {
+			marks, _ := assertDecorationOnlyAround(t, "the confetti at "+at+" "+clock(m).String(),
+				static, m.View(), width, height, 0, string(confettiGlyphs))
+			seen += marks
+		})
+		if seen == 0 {
+			t.Errorf("at %s no confetti was ever drawn", at)
 		}
 	}
 }
