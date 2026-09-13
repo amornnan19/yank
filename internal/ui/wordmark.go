@@ -52,3 +52,8 @@ func wordmarkView(cw int) string {
 	}
 	return join(lines...)
 }
+
+// wordmarkLetters is the column span [from, to) of each letter of the drawing,
+// y a n k in order. Every drawn cell of wordmarkRows lies inside one of them;
+// the motion that moves a letter moves exactly these columns.
+var wordmarkLetters = [][2]int{{0, 5}, {7, 12}, {14, 19}, {21, 25}}

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
@@ -683,6 +684,26 @@ func colourScreens(t *testing.T) map[string]Model {
 	done := downloadingModel(t, &fakes{})
 	done = send(done, downloadDoneMsg{seq: done.seq, res: &ytdlp.DownloadResult{Path: "/Users/x/Downloads/a b.mp4"}})
 	out["done without note"] = done
+
+	// The input screen with motion, at three moments: mid-intro, with the
+	// site badge fading in and the shimmer crossing, and mid-exit. Every
+	// frame of every effect is measured against the same rule in
+	// TestEveryMotionFrameFitsTheTerminalAndThePalette; these keep the
+	// animated screen in the one table every screen is held to.
+	intro := runMotion(t, motionModel(t, &fakes{}, 80, 24), 300*time.Millisecond, nil)
+	out["input motion mid-intro"] = intro
+	// The times are literals, not the effects' constants, so deleting an
+	// effect never breaks this file.
+	badge := runMotion(t, motionModel(t, &fakes{}, 80, 24), 4*time.Second, nil)
+	badge.input.SetValue("https://www.youtube.com/watch?v=x")
+	badge = send(badge, runes("y"))
+	badge = runMotion(t, badge, 4300*time.Millisecond, nil)
+	out["input motion badge and shimmer"] = badge
+	exit := badge
+	exit.hasBin = true
+	exit = send(exit, keyOf(tea.KeyEnter))
+	exit = runMotion(t, exit, clock(exit)+100*time.Millisecond, nil)
+	out["input motion mid-exit"] = exit
 
 	for _, name := range []string{"probing first run", "picker cursor moved", "converting", "done without note"} {
 		out[name] = colourBar(out[name])

@@ -2,6 +2,8 @@ package ui
 
 import (
 	"context"
+	"os"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -15,7 +17,12 @@ import (
 // startURL is the URL yank was started with, or "" to start on the input
 // screen; see New for what a URL that does not validate does.
 func Run(ctx context.Context, deps Deps, startURL string) error {
-	return runProgram(tea.NewProgram(New(ctx, deps, startURL), tea.WithAltScreen(), tea.WithContext(ctx)))
+	m := New(ctx, deps, startURL)
+	// Motion is switched on here rather than in New, so every model a test
+	// builds is the static screen unless it asks for motion. The seed is the
+	// only thing that differs run to run.
+	m.motion = newMotion(os.LookupEnv, uint64(time.Now().UnixNano()))
+	return runProgram(tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx)))
 }
 
 // runProgram is the loop plus the cleanup that has to happen whichever way it

@@ -110,6 +110,10 @@ type Model struct {
 	pending int
 	// quitting marks the window between ctrl+c and the program actually ending.
 	quitting bool
+
+	// motion is the input screen's animation; see motion.go. Its zero value
+	// is switched off, which is what New builds.
+	motion motion
 }
 
 // New builds the model. ctx bounds the whole program: cancelling it cancels
@@ -178,8 +182,27 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(textinput.Blink, startURLCmd())
 }
 
-// Update is the whole state machine.
+// Update is the whole state machine, with the input screen's motion kept in
+// step behind it: a motion tick is the clock and goes to the motion alone, and
+// every other message is handled by update and then shown to syncMotion, which
+// turns what it changed into motion events and keeps one tick outstanding at
+// most — none at all off the input screen.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if tick, ok := msg.(motionTickMsg); ok {
+		return m.handleMotionTick(tick)
+	}
+	prevState, prevValue := m.state, m.input.Value()
+	key, isKey := msg.(tea.KeyMsg)
+	entered := isKey && key.Type == tea.KeyEnter
+	next, cmd := m.update(msg)
+	nm := next.(Model)
+	// Two statements, for the reason startDownload gives: syncMotion mutates nm.
+	motionCmd := nm.syncMotion(prevState, prevValue, entered)
+	return nm, tea.Batch(cmd, motionCmd)
+}
+
+// update is every message but the motion tick.
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg.(type) {
 	case resolvedMsg, probeDoneMsg, downloadDoneMsg:
 		// One started run has reported back, whichever attempt it belonged to
@@ -509,6 +532,10 @@ func (m Model) reset() Model {
 	// the message whatever attempt it belonged to, so copying the count keeps
 	// it honest rather than double-counting.
 	fresh.pending = m.pending
+	// Motion is a property of the session, not of an attempt: whether it is
+	// switched on, the seeded source, the intro already played, and the tick
+	// generation a stale tick has to be recognised against.
+	fresh.motion = m.motion
 	fresh.layout()
 	return fresh
 }
@@ -588,6 +615,7 @@ func (m Model) settle() (tea.Model, tea.Cmd) {
 // its own exit.
 func (m Model) finishQuit() (tea.Model, tea.Cmd) {
 	m.releaseProbe()
+	m.motion.halted = true
 	return m, tea.Quit
 }
 

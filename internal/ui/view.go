@@ -19,6 +19,11 @@ func (m Model) View() string {
 	if m.quitting {
 		return styles().doc.Render(m.header() + m.quittingView())
 	}
+	if m.motionShowing() {
+		// The input screen with motion, which is also what the probing screen
+		// looks like while the exit animation plays over it.
+		return styles().doc.Render(m.animatedInputView())
+	}
 
 	var body string
 	switch m.state {
@@ -63,7 +68,12 @@ func (m Model) inputView() string {
 	if m.hint != "" {
 		lines = append(lines, fit(styles().faint, m.hint, cw))
 	}
-	return join(lines...) + "\n\n" + m.help("enter  fetch", "ctrl+c  quit")
+	return join(lines...) + "\n\n" + m.inputLegend()
+}
+
+// inputLegend is the input screen's key legend, animated or not.
+func (m Model) inputLegend() string {
+	return m.help("enter  fetch", "ctrl+c  quit")
 }
 
 // quittingView is what ctrl+c shows while the run it cancelled finishes dying.

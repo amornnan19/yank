@@ -24,6 +24,11 @@ const (
 	ansiYellow = "3"
 	ansiBlue   = "4"
 	ansiCyan   = "6"
+
+	// The bright half of the palette, slots 8-15, for the input screen's
+	// motion: the same sixteen colours the user's theme already tunes.
+	ansiBrightCyan  = "14"
+	ansiBrightWhite = "15"
 )
 
 // styleSet is every lipgloss style the views draw with.
@@ -32,6 +37,10 @@ const (
 type styleSet struct {
 	// app is the name above every screen.
 	app lipgloss.Style
+
+	// bright is the highlight the input screen's motion passes over the
+	// wordmark: the shimmer band and the reveal sweep.
+	bright lipgloss.Style
 
 	// faint is for text that is there when wanted and out of the way when
 	// not: the help line, hints, the uploader.
@@ -98,6 +107,7 @@ var styles = sync.OnceValue(func() styleSet {
 	styleBuilds.Add(1)
 	return styleSet{
 		app:       lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(ansiCyan)),
+		bright:    lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(ansiBrightWhite)),
 		faint:     lipgloss.NewStyle().Faint(true),
 		title:     lipgloss.NewStyle().Bold(true),
 		box:       frame(ansiCyan),
