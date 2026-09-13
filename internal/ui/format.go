@@ -2,11 +2,13 @@ package ui
 
 import (
 	"fmt"
+	"iter"
 	"math"
 	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 const (
@@ -198,6 +200,38 @@ func endOfEscape(rs []rune, i int) int {
 	return last
 }
 
+// graphemes yields each grapheme cluster of s with its display width. s must
+// already be sanitised.
+//
+// A cluster is what the terminal draws as one character: ❤️ is two runes, a
+// family emoji joined by U+200D is five, a flag is two regional indicators, and
+// é may be an e and a combining accent. Adding up widths rune by rune gets every
+// one of those wrong — ❤️ comes out a cell narrower than it draws, the family
+// four cells wider — and cutting between two runes of a cluster leaves half of
+// it on screen. Every width in this package that pads, cuts or scrolls remote
+// text is counted with this, and never per rune.
+//
+// The boundaries come from x/ansi's segmenter, the one lipgloss.Width measures
+// with, and each cluster's width is lipgloss.Width's, so the cells counted here
+// add up to what lipgloss.Width says of the whole string and every other
+// measurement in the package agrees with this one. A different segmenter is not
+// a detail: rivo/uniseg's Unicode 15.0 rules split an Indic conjunct such as
+// क्ष after the virama, and the two halves measure a cell wider than the whole.
+// The width is not the one FirstGraphemeCluster returns either: lipgloss.Width
+// counts an ASCII byte as one cell before it looks at what follows, so it
+// measures the keycap 1️⃣ as one cell where the cluster's own width says two.
+func graphemes(s string) iter.Seq2[string, int] {
+	return func(yield func(string, int) bool) {
+		for s != "" {
+			c, _ := ansi.FirstGraphemeCluster(s, ansi.GraphemeWidth)
+			s = s[len(c):]
+			if !yield(c, lipgloss.Width(c)) {
+				return
+			}
+		}
+	}
+}
+
 // truncate sanitises s and cuts it to at most w display cells, marking the cut
 // with an ellipsis.
 //
@@ -206,9 +240,10 @@ func endOfEscape(rs []rune, i int) int {
 // and CLAUDE.md's rule about remote text is enforced here because this is the
 // one function every remote string passes through on its way to the screen.
 //
-// It measures with lipgloss.Width rather than counting runes: a CJK title is
-// two cells per character, and a byte or rune count would let one wrap the
-// layout apart — which is the whole reason this exists.
+// It measures display cells rather than counting runes: a CJK title is two
+// cells per character, and a byte or rune count would let one wrap the layout
+// apart — which is the whole reason this exists. The cut falls between
+// grapheme clusters, never inside one.
 func truncate(s string, w int) string {
 	s = sanitise(s)
 	if w <= 0 {
@@ -223,13 +258,12 @@ func truncate(s string, w int) string {
 
 	var b strings.Builder
 	used := 0
-	for _, r := range s {
-		rw := lipgloss.Width(string(r))
-		if used+rw > w-1 {
+	for c, cw := range graphemes(s) {
+		if used+cw > w-1 {
 			break
 		}
-		b.WriteRune(r)
-		used += rw
+		b.WriteString(c)
+		used += cw
 	}
 	return b.String() + ellipsis
 }

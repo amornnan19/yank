@@ -99,6 +99,19 @@ helper, not a sanitiser: it reports the widest *line* of a multi-line string, so
 title with a newline in it measures small, survives truncation intact, and takes
 an extra row on screen. Truncate before styling, never after — cutting a rendered
 string can drop its reset sequence and let the style bleed down the page.
+Width is measured per grapheme cluster, never per rune: `❤️` is two runes and two
+cells where a per-rune sum says one, a ZWJ family is five runes and two cells
+where it says six, and a cut between runes leaves half a character on screen.
+Anything that pads, cuts or scrolls text goes through `graphemes` in
+`internal/ui/format.go`. Split text into clusters with the same segmenter that
+measures it — x/ansi's, which `lipgloss.Width` uses — and measure each cluster
+with `lipgloss.Width`, so the cells add up to what `lipgloss.Width` says of the
+whole. A different segmenter disagrees where Unicode changed: `rivo/uniseg`
+v0.4.7 predates GB9c and splits an Indic conjunct such as `क्ष` after the
+virama, and the halves measure two cells where the whole is one, so a marquee
+runs out of window before its travel ends and a cut leaves `क्` on screen.
+x/ansi's own per-cluster width is not the one to use either: `lipgloss.Width`
+says the keycap `1️⃣` is one cell and `FirstGraphemeCluster` says two.
 
 **Dependencies.** `bubbletea`, `bubbles`, `lipgloss`, and what they already
 compile in. The standard library covers the rest, and `internal/ytdlp` imports no
