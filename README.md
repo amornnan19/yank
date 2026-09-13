@@ -27,6 +27,10 @@ The version string can be set at build time:
 go build -ldflags "-X main.Version=1.2.3" ./cmd/yank
 ```
 
+The `Makefile` wraps the same commands: `make build` (with `VERSION=1.2.3` to
+set the version), `make check` for gofmt, vet and tests, `make help` for the
+rest.
+
 ## Usage
 
 ```
