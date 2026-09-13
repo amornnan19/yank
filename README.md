@@ -4,6 +4,8 @@ A terminal UI for downloading video with [yt-dlp](https://github.com/yt-dlp/yt-d
 Paste a URL, pick a format from a short list, watch a progress bar, get the path
 of the file that landed on disk.
 
+Website: <https://yank.ghostshift.tech/>
+
 yank is a wrapper. It does not fetch a single byte of video itself: yt-dlp does
 the downloading, and yank is the interface in front of it.
 
