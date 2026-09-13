@@ -4,12 +4,15 @@ BIN := yank
 VERSION ?=
 LDFLAGS := $(if $(VERSION),-X main.Version=$(VERSION))
 
-.PHONY: all build run test race vet fmt fmt-check check clean help
+.PHONY: all build install run test race vet fmt fmt-check check clean help
 
 all: check build
 
 build: ## Build ./yank
 	go build -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/yank
+
+install: ## Install yank into $(go env GOBIN), or GOPATH/bin, so it runs from anywhere
+	go install -ldflags "$(LDFLAGS)" ./cmd/yank
 
 run: build ## Build and run; pass a URL with ARGS=<url>
 	./$(BIN) $(ARGS)
