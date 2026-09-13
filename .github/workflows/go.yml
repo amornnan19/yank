@@ -1,0 +1,43 @@
+name: Go
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # darwin and linux are the platforms yank is run on; the zipapp and
+        # Command Line Tools paths in internal/ytdlp differ between them.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # The version comes from go.mod so CI never drifts from it.
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: make fmt-check
+
+      - name: Vet
+        run: make vet
+
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Race
+        run: make race

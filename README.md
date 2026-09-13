@@ -9,7 +9,14 @@ the downloading, and yank is the interface in front of it.
 
 ## Install
 
-Go 1.27.1 or newer is required (the version in `go.mod`). Build from a clone:
+Go 1.27.1 or newer is required (the version in `go.mod`):
+
+```
+go install github.com/amornnan19/yank/cmd/yank@latest
+```
+
+That puts `yank` in `go env GOBIN`, or `$(go env GOPATH)/bin`, which must be on
+your `PATH`. Or build from a clone:
 
 ```
 git clone https://github.com/amornnan19/yank
@@ -17,9 +24,7 @@ cd yank
 go build -o yank ./cmd/yank
 ```
 
-Then put the `yank` binary somewhere on your `PATH`. There is no
-`go install ...@latest` line here because the repository is private, and a
-command that cannot work for the person reading it does not belong in a README.
+Then put the `yank` binary somewhere on your `PATH`.
 
 The version string can be set at build time:
 
