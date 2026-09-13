@@ -549,8 +549,15 @@ func chooseAsset(ctx context.Context, goarch string, env pythonEnv) (asset strin
 	return assetName(env.goos, goarch), false
 }
 
-// minPythonMinor is the oldest Python 3 the zipapp may be run with.
-const minPythonMinor = 9
+// minPythonMinor is the oldest Python 3 the zipapp may be run with. It is
+// yt-dlp's own minimum, not a choice of ours: pyproject.toml declares
+// requires-python = ">=3.10", the README's "Dependencies" section says
+// "Python versions 3.10+ (CPython) and 3.11+ (PyPy) are supported", and
+// yt_dlp/__init__.py exits 1 on anything older with "Only Python versions 3.10
+// and above are supported by yt-dlp" (seen from the 2026.07.04 zipapp under
+// the macOS Command Line Tools' Python 3.9.6, #27). Accepting an older python
+// costs a zipapp download and a failed probe before the bundle is used anyway.
+const minPythonMinor = 10
 
 // pythonEnv is what the python checks consult. hostPython fills it from the
 // running system; tests substitute the pieces so the checks can be exercised
@@ -590,7 +597,7 @@ func hostPython() pythonEnv {
 // usablePython reports whether env has a python3 the zipapp can be run with.
 // The rule (#19): python3 is on PATH; on darwin, if it resolves into
 // env.systemDir, xcode-select -p exits 0 first; and python3 --version reports
-// 3.9 or newer. No other interpreter is looked for and PATH is not touched. A
+// 3.10 or newer (minPythonMinor). No other interpreter is looked for and PATH is not touched. A
 // false answer is "not this run", never an error: every failure, positive or
 // inconclusive, means the bundle, which needs no interpreter and so is always
 // the safe choice.

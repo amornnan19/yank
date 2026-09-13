@@ -1132,9 +1132,10 @@ func TestUsablePythonReadsTheVersion(t *testing.T) {
 		want bool
 	}{
 		{"3.8 is too old", "echo 'Python 3.8.10'\n", false},
-		{"3.9 is the floor", "echo 'Python 3.9.6'\n", true},
+		{"3.9 is too old", "echo 'Python 3.9.6'\n", false},
+		{"3.10 is the floor", "echo 'Python 3.10.0'\n", true},
 		{"3.12", "echo 'Python 3.12.1'\n", true},
-		{"3.10 is not 3.1", "echo 'Python 3.10.0'\n", true},
+		{"3.13", "echo 'Python 3.13.0'\n", true},
 		{"version printed on stderr", "echo 'Python 3.12.1' >&2\n", true},
 		{"python 2 answers on stderr", "echo 'Python 2.7.18' >&2\n", false},
 		{"not python at all", "echo 'Perl 5'\n", false},
@@ -1317,11 +1318,18 @@ func TestPythonIsRecent(t *testing.T) {
 		version string
 		want    bool
 	}{
-		{"Python 3.9.6", true},
+		{"Python 3.9.6", false},
+		{"Python 3.9.25", false},
+		{"Python 3.10.0", true},
+		{"Python 3.13.2", true},
 		{"Python 3.14.7\n", true},
 		{"Python 3.8.10", false},
+		{"Python 3.1", false},
 		{"Python 3.", false},
 		{"Python 3.x", false},
+		{"Python 3.-10", false},
+		{"Python 3 .10", false},
+		{"Python 310", false},
 		{"Python 2.7.18", false},
 		{"Python 4.0.0", false},
 		{"", false},
