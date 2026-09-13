@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/lipgloss"
 	"strings"
@@ -291,6 +292,40 @@ func TestResolveFailureLandsInError(t *testing.T) {
 	if !strings.Contains(m.View(), "does not run") {
 		t.Fatalf("the reason is not on screen:\n%s", m.View())
 	}
+}
+
+func TestResolveTimeoutLandsInErrorAndCancelReturnsToInput(t *testing.T) {
+	// #28: the model routes on IsCancelled alone. A download that hit our own
+	// limit is a failure the user waited for and gets told about; one the user
+	// cancelled goes back to the input screen without a word.
+	t.Run("timeout", func(t *testing.T) {
+		m := testModel(t, &fakes{}, 80)
+		m = typeURL(m, "https://example.com/v")
+		m = send(m, keyOf(tea.KeyEnter))
+
+		m = send(m, resolvedMsg{seq: m.seq, err: errString("could not fetch yt-dlp: the download timed out after 10m0s: context deadline exceeded")})
+
+		if m.state != stateError {
+			t.Fatalf("state = %v, want stateError", m.state)
+		}
+		if !strings.Contains(m.View(), "timed out after 10m0s") {
+			t.Fatalf("the timeout is not on screen:\n%s", m.View())
+		}
+	})
+	t.Run("cancelled", func(t *testing.T) {
+		m := testModel(t, &fakes{}, 80)
+		m = typeURL(m, "https://example.com/v")
+		m = send(m, keyOf(tea.KeyEnter))
+
+		m = send(m, resolvedMsg{seq: m.seq, err: fmt.Errorf("could not fetch yt-dlp: %w", context.Canceled)})
+
+		if m.state != stateInput {
+			t.Fatalf("state = %v, want stateInput", m.state)
+		}
+		if strings.Contains(m.View(), "could not fetch") {
+			t.Fatalf("a cancelled Resolve put its error on screen:\n%s", m.View())
+		}
+	})
 }
 
 // --- the three probe sentinels ----------------------------------------------

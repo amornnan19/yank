@@ -280,7 +280,7 @@ func resolveWith(ctx context.Context, events chan<- ResolveEvent, timeout, delay
 			}
 		}
 		asset, zipapp := chooseAsset(ctx, runtime.GOARCH, env)
-		version, err := installAsset(ctx, base, asset, cached, timeout, delay)
+		version, err := installAsset(ctx, base, asset, cached, httpTimeout, timeout, delay)
 		if err != nil && zipapp && isBadBinary(err) {
 			// The zipapp started and refused: a python3 that answered --version
 			// but cannot run yt-dlp, say. installAsset has already removed it.
@@ -288,7 +288,7 @@ func resolveWith(ctx context.Context, events chan<- ResolveEvent, timeout, delay
 			// Resolve makes; a positive failure of the bundle is reported as it
 			// always was. Anything inconclusive was returned above untouched,
 			// because it says nothing about which asset is right.
-			version, err = installAsset(ctx, base, assetName(runtime.GOOS, runtime.GOARCH), cached, timeout, delay)
+			version, err = installAsset(ctx, base, assetName(runtime.GOOS, runtime.GOARCH), cached, httpTimeout, timeout, delay)
 		}
 		return version, err
 	}
@@ -333,8 +333,8 @@ func resolveWith(ctx context.Context, events chan<- ResolveEvent, timeout, delay
 // the caller can tell it from an inconclusive one. An inconclusive failure
 // keeps the file: it was checksum-verified moments ago and a cancellation, a
 // probe timeout or an OS refusal says nothing about it.
-func installAsset(ctx context.Context, base, asset, dest string, timeout, delay time.Duration) (string, error) {
-	if err := downloadFrom(ctx, base, asset, dest); err != nil {
+func installAsset(ctx context.Context, base, asset, dest string, limit, timeout, delay time.Duration) (string, error) {
+	if err := downloadFrom(ctx, base, asset, dest, limit); err != nil {
 		return "", err
 	}
 
@@ -851,13 +851,25 @@ func classifyProbe(path string, out []byte, runErr, callerCtxErr, probeCtxErr er
 // lands in a unique temp file inside dest's directory first, so an
 // interrupted run cannot leave a half-written file at dest and two yank
 // processes racing on first run cannot write to the same path. base is
-// releaseBase in production; tests point it at a local server.
-func downloadFrom(ctx context.Context, base, asset, dest string) error {
-	client := &http.Client{Timeout: httpTimeout}
+// releaseBase in production; tests point it at a local server. limit bounds
+// the whole fetch, body included; it is httpTimeout in production.
+//
+// limit is a context of its own rather than http.Client.Timeout so that a
+// timeout is known positively from that context, not guessed from the error:
+// a client timeout and a dial timeout both satisfy
+// errors.Is(context.DeadlineExceeded), and so does the caller's deadline.
+func downloadFrom(ctx context.Context, base, asset, dest string, limit time.Duration) error {
+	fetchCtx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+	client := &http.Client{}
 
-	tmpName, err := fetchVerified(ctx, client, base, asset, filepath.Dir(dest), "yt-dlp-*")
+	tmpName, err := fetchVerified(fetchCtx, client, base, asset, filepath.Dir(dest), "yt-dlp-*")
 	if err != nil {
-		return fmt.Errorf("could not fetch yt-dlp: %w", err)
+		what := "could not fetch yt-dlp"
+		if ctx.Err() == nil && fetchCtx.Err() != nil && errors.Is(err, context.DeadlineExceeded) {
+			what = fmt.Sprintf("could not fetch yt-dlp: the download timed out after %s", limit)
+		}
+		return failure(ctx, "could not fetch yt-dlp", what, err)
 	}
 	// Removed unless the rename below succeeds first.
 	defer os.Remove(tmpName)
@@ -866,6 +878,24 @@ func downloadFrom(ctx context.Context, base, asset, dest string) error {
 		return fmt.Errorf("could not fetch yt-dlp: %w", err)
 	}
 	return nil
+}
+
+// failure turns a failed step that took ctx into the error returned for it.
+// The caller's cancellation is checked first and put in the chain, under
+// cancelled, so IsCancelled is true for it. A context error that is not the
+// caller's — our own timeout, an HTTP client or dial timeout, all of which
+// satisfy errors.Is(context.DeadlineExceeded) — is flattened into the text
+// under what instead, or IsCancelled would report it as the user's ctrl+c.
+// Any other error keeps its chain, so a typed failure such as
+// errChecksumMismatch stays matchable.
+func failure(ctx context.Context, cancelled, what string, err error) error {
+	if cerr := ctx.Err(); cerr != nil {
+		return fmt.Errorf("%s: %w", cancelled, cerr)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%s: %v", what, err)
+	}
+	return fmt.Errorf("%s: %w", what, err)
 }
 
 // fetchVerified downloads the named release asset from base into a new temp
@@ -933,8 +963,9 @@ func installVerified(ctx context.Context, tmpName, dest string) error {
 }
 
 // sweepStaleTemps removes abandoned download temp files from dir. Only entries
-// untouched for longer than maxAge are removed: the HTTP client timeout bounds
-// how long a live download can go without writing, so anything older than that
+// untouched for longer than maxAge are removed: httpTimeout, applied as the
+// fetch context's deadline on first run and as the client timeout on update,
+// bounds how long a live download can go without writing, so anything older than that
 // belongs to a run that was interrupted and will never come back. It is best
 // effort; a failure here must not stop a download.
 func sweepStaleTemps(dir string, maxAge time.Duration) {

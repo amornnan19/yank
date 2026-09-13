@@ -1025,6 +1025,147 @@ func TestResolveDownloadsWhenNothingIsCached(t *testing.T) {
 	}
 }
 
+// --- a download that stalls (#28) --------------------------------------------
+
+// stallingRelease is a release base whose SHA2-256SUMS answers at once and
+// lists asset, and whose asset sends its headers and a first chunk and then
+// stops sending without closing the response. stalled is closed once that
+// chunk has been flushed, so a test can act while the body is in flight.
+func stallingRelease(t *testing.T, asset string) (base string, stalled <-chan struct{}) {
+	t.Helper()
+	ch := make(chan struct{})
+	done := make(chan struct{})
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.TrimPrefix(r.URL.Path, "/") == checksumsAsset {
+			fmt.Fprintf(w, "%x  %s\n", sha256.Sum256([]byte("never sent in full")), asset)
+			return
+		}
+		w.Header().Set("Content-Length", "1048576")
+		io.WriteString(w, "#!/bin/sh\n")
+		w.(http.Flusher).Flush()
+		once.Do(func() { close(ch) })
+		select {
+		case <-r.Context().Done():
+		case <-done:
+		}
+	}))
+	t.Cleanup(func() {
+		close(done)
+		srv.Close()
+	})
+	return srv.URL + "/", ch
+}
+
+func TestInstallAssetReportsItsOwnTimeoutAsAFailure(t *testing.T) {
+	// An http.Client timeout satisfies errors.Is(context.DeadlineExceeded).
+	// Wrapped as it came, IsCancelled would read ten minutes of waiting as the
+	// user's own esc and the UI would return to the input screen saying
+	// nothing.
+	dest := filepath.Join(t.TempDir(), "yt-dlp")
+	base, _ := stallingRelease(t, "yt-dlp_linux")
+
+	_, err := installAsset(t.Context(), base, "yt-dlp_linux", dest, 300*time.Millisecond, time.Minute, 300*time.Millisecond)
+	if err == nil {
+		t.Fatal("installAsset returned no error, want the timeout")
+	}
+	if IsCancelled(err) {
+		t.Errorf("IsCancelled(%v) = true; nobody cancelled this, and our own timeout is not a ctrl+c", err)
+	}
+	if !strings.Contains(err.Error(), "download timed out after 300ms") {
+		t.Errorf("error = %v, want it to say the download timed out and name the limit", err)
+	}
+	if _, serr := os.Stat(dest); !errors.Is(serr, fs.ErrNotExist) {
+		t.Errorf("dest: %v, want nothing installed", serr)
+	}
+}
+
+func TestInstallAssetReportsTheCallersCancelAsCancelled(t *testing.T) {
+	tests := []struct {
+		name   string
+		ctx    func(t *testing.T, stalled <-chan struct{}) context.Context
+		target error
+	}{
+		{
+			name: "cancelled during the stall",
+			ctx: func(t *testing.T, stalled <-chan struct{}) context.Context {
+				ctx, cancel := context.WithCancel(t.Context())
+				t.Cleanup(cancel)
+				go func() {
+					<-stalled
+					cancel()
+				}()
+				return ctx
+			},
+			target: context.Canceled,
+		},
+		{
+			// The caller's own deadline is the caller's, not ours: it ends
+			// the wait the way a cancel does.
+			name: "the caller's deadline during the stall",
+			ctx: func(t *testing.T, _ <-chan struct{}) context.Context {
+				ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+				t.Cleanup(cancel)
+				return ctx
+			},
+			target: context.DeadlineExceeded,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dest := filepath.Join(t.TempDir(), "yt-dlp")
+			base, stalled := stallingRelease(t, "yt-dlp_linux")
+
+			_, err := installAsset(tt.ctx(t, stalled), base, "yt-dlp_linux", dest, time.Minute, time.Minute, 300*time.Millisecond)
+			if err == nil {
+				t.Fatal("installAsset returned no error, want the cancellation")
+			}
+			if !IsCancelled(err) || !errors.Is(err, tt.target) {
+				t.Errorf("error = %v, want %v in the chain so IsCancelled is true", err, tt.target)
+			}
+			if strings.Contains(err.Error(), "timed out") {
+				t.Errorf("error = %v, want the caller's cancel not reported as our timeout", err)
+			}
+		})
+	}
+}
+
+func TestInstallAssetKeepsTypedFailuresMatchable(t *testing.T) {
+	// Only a context error is flattened into the text. A positive failure of
+	// the release keeps its sentinel in the chain.
+	const asset = "yt-dlp_linux"
+	body := "#!/bin/sh\necho 2026.08.19\n"
+	tests := []struct {
+		name   string
+		sums   string
+		target error
+	}{
+		{"checksum mismatch", fmt.Sprintf("%x  %s\n", sha256.Sum256([]byte("something else")), asset), errChecksumMismatch},
+		{"asset not listed", fmt.Sprintf("%x  %s\n", sha256.Sum256([]byte(body)), "yt-dlp_macos"), errNoChecksum},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.TrimPrefix(r.URL.Path, "/") == checksumsAsset {
+					io.WriteString(w, tt.sums)
+					return
+				}
+				io.WriteString(w, body)
+			}))
+			t.Cleanup(srv.Close)
+			dest := filepath.Join(t.TempDir(), "yt-dlp")
+
+			_, err := installAsset(t.Context(), srv.URL+"/", asset, dest, time.Minute, time.Minute, 300*time.Millisecond)
+			if !errors.Is(err, tt.target) {
+				t.Errorf("error = %v, want errors.Is(%v)", err, tt.target)
+			}
+			if IsCancelled(err) {
+				t.Errorf("IsCancelled(%v) = true", err)
+			}
+		})
+	}
+}
+
 // --- the zipapp release asset (#19) -----------------------------------------
 
 // noPython is a host with no python3 anywhere: the bundle's case. Its goos is

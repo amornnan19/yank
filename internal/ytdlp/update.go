@@ -240,7 +240,7 @@ func (u updater) update(ctx context.Context, res Result) (UpdateResult, error) {
 
 	tag, err := u.latestTag(ctx)
 	if err != nil {
-		return out, u.failure(ctx, "could not look up the latest yt-dlp release", err)
+		return out, failure(ctx, "yt-dlp update cancelled", "could not look up the latest yt-dlp release", err)
 	}
 	latest, _ := parseVersion(tag) // latestTag has validated it
 	out.Latest = tag
@@ -275,7 +275,7 @@ func (u updater) update(ctx context.Context, res Result) (UpdateResult, error) {
 			writeCheck(res.Path, rec)
 			out.Failed = tag
 		}
-		return out, u.failure(ctx, "could not update yt-dlp to "+tag, err)
+		return out, failure(ctx, "yt-dlp update cancelled", "could not update yt-dlp to "+tag, err)
 	}
 	rec.CheckedNS = u.now().UnixNano()
 	if rec.FailedTag == tag {
@@ -360,7 +360,7 @@ func (u updater) promote(ctx context.Context, res Result, out UpdateResult) (Upd
 		return out, fmt.Errorf("could not update yt-dlp to %s: %w", out.Staged, perr)
 	}
 	if err != nil {
-		return out, u.failure(ctx, "could not update yt-dlp to "+out.Staged, err)
+		return out, failure(ctx, "yt-dlp update cancelled", "could not update yt-dlp to "+out.Staged, err)
 	}
 	switch {
 	case refused != nil:
@@ -415,21 +415,6 @@ func cutLast(s, sep string) (before, after string, found bool) {
 		return s, "", false
 	}
 	return s[:i], s[i+len(sep):], true
-}
-
-// failure turns a failed step into the error update returns. The caller's
-// cancellation is checked first and put in the chain, so IsCancelled is true
-// for it. A context error that is not the caller's — an HTTP client timeout
-// satisfies errors.Is(context.DeadlineExceeded) — is flattened into the text
-// instead, or IsCancelled would report our own timeout as the user's ctrl+c.
-func (u updater) failure(ctx context.Context, what string, err error) error {
-	if cerr := ctx.Err(); cerr != nil {
-		return fmt.Errorf("yt-dlp update cancelled: %w", cerr)
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("%s: %v", what, err)
-	}
-	return fmt.Errorf("%s: %w", what, err)
 }
 
 // --- versions ---------------------------------------------------------------
