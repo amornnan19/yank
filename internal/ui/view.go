@@ -462,13 +462,27 @@ func (m Model) statsLine() string {
 
 func (m Model) doneView() string {
 	cw := m.contentWidth()
-	lines := []string{fit(styles().success, savedTitle, cw), ""}
+	title := savedTitle
+	if m.result != nil && m.result.AlreadyExisted {
+		// yt-dlp skipped the download. "Saved" would read as "I just wrote
+		// this", and the file may be from an earlier pick of another format.
+		title = alreadyTitle
+	}
+	lines := []string{fit(styles().success, title, cw), ""}
 	if m.result != nil {
 		lines = append(lines, m.pathView(m.result.Path))
+		if m.result.AlreadyExisted {
+			lines = append(lines, "", styles().faint.Render(wrap(alreadyNote, cw)))
+		}
 		if m.result.UsedWorkingDir {
 			// DownloadsDir fell back. Saying "check your Downloads folder"
 			// would send the user to a directory the file is not in.
-			lines = append(lines, "", styles().faint.Render(wrap(workingDirNote, cw)))
+			note := workingDirNote
+			if m.result.AlreadyExisted {
+				// Nothing was written, so "this went to" would be untrue.
+				note = alreadyWorkingDirNote
+			}
+			lines = append(lines, "", styles().faint.Render(wrap(note, cw)))
 		}
 	}
 	return join(lines...) + "\n\n" + m.help("enter  another", "q  quit")
@@ -499,13 +513,24 @@ func (m Model) pathView(path string) string {
 
 // savedTitle and failedTitle head the two ending screens. The glyph carries
 // the same signal as the colour on a terminal rendering none, for two cells.
+// alreadyTitle replaces savedTitle when yt-dlp found the file already there:
+// the outcome is still a success, so it keeps the glyph and the colour.
 const (
-	savedTitle  = "✓ Saved"
-	failedTitle = "✗ That did not work"
+	savedTitle   = "✓ Saved"
+	alreadyTitle = "✓ Already there"
+	failedTitle  = "✗ That did not work"
 )
 
 // workingDirNote explains a path that is not where downloads normally go.
 const workingDirNote = "Your home directory could not be found, so this went to the directory yank was started in rather than to Downloads."
+
+// alreadyWorkingDirNote replaces workingDirNote when yt-dlp skipped the download:
+// nothing went anywhere, the file was only found in the fallback directory.
+const alreadyWorkingDirNote = "Your home directory could not be found, so yank looked in the directory it was started in rather than in Downloads."
+
+// alreadyNote explains a done screen for a download yt-dlp skipped. It names no
+// directory, so it stays true beside alreadyWorkingDirNote when both apply.
+const alreadyNote = "This file was already there, so nothing was downloaded. Delete or rename it and pick again to fetch a fresh copy."
 
 func (m Model) errorView() string {
 	cw := m.contentWidth()

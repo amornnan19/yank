@@ -148,6 +148,12 @@ func screens(t *testing.T) map[string]Model {
 	done = send(done, downloadDoneMsg{seq: done.seq, res: &ytdlp.DownloadResult{Path: longPath, UsedWorkingDir: true}})
 	out["done"] = done
 
+	already := downloadingModel(t, &fakes{})
+	already = send(already, downloadDoneMsg{seq: already.seq, res: &ytdlp.DownloadResult{
+		Path: longPath, UsedWorkingDir: true, AlreadyExisted: true,
+	}})
+	out["done already there"] = already
+
 	failed := downloadingModel(t, &fakes{})
 	failed = send(failed, downloadDoneMsg{seq: failed.seq, err: hardErr()})
 	out["error"] = failed
@@ -174,6 +180,84 @@ func TestDoneAndErrorScreensCarryTheirGlyphs(t *testing.T) {
 	if !strings.Contains(failed.View(), "✗ That did not work") {
 		t.Errorf("the error screen does not read \"✗ That did not work\":\n%s", failed.View())
 	}
+}
+
+// A download yt-dlp skipped because the file was already there must not read as
+// a fresh one: "Saved" says "I just wrote this", and the file may be from an
+// earlier pick of a different format with the same name.
+func TestDoneScreenSaysWhenTheFileWasAlreadyThere(t *testing.T) {
+	const path = "/Users/x/Downloads/Me at the zoo.mkv"
+	m := downloadingModel(t, &fakes{})
+	m = send(m, tea.WindowSizeMsg{Width: 200, Height: 24})
+	m = send(m, downloadDoneMsg{seq: m.seq, res: &ytdlp.DownloadResult{Path: path, AlreadyExisted: true}})
+
+	view := m.View()
+	if !strings.Contains(view, "✓ Already there") {
+		t.Errorf("the done screen for a skipped download does not read \"✓ Already there\":\n%s", view)
+	}
+	if strings.Contains(view, "Saved") {
+		t.Errorf("the done screen for a skipped download still says Saved:\n%s", view)
+	}
+	if !strings.Contains(view, path) {
+		t.Errorf("the path is not on the done screen:\n%s", view)
+	}
+	if !strings.Contains(view, "nothing was downloaded") {
+		t.Errorf("the done screen does not explain that nothing was downloaded:\n%s", view)
+	}
+	// The title stays on the row "✓ Saved" occupies, so the path does not move.
+	fresh := downloadingModel(t, &fakes{})
+	fresh = send(fresh, tea.WindowSizeMsg{Width: 200, Height: 24})
+	fresh = send(fresh, downloadDoneMsg{seq: fresh.seq, res: &ytdlp.DownloadResult{Path: path}})
+	if got, want := lineContaining(view, path), lineContaining(fresh.View(), path); got != want || got < 0 {
+		t.Errorf("the path is on row %d, want row %d as on the Saved screen", got, want)
+	}
+	if lineContaining(view, "✓ Already there") != lineContaining(fresh.View(), "✓ Saved") {
+		t.Errorf("the title moved:\n%s\n---\n%s", view, fresh.View())
+	}
+
+	// A fresh download says nothing about it.
+	if strings.Contains(fresh.View(), "nothing was downloaded") || strings.Contains(fresh.View(), "Already there") {
+		t.Errorf("the already-there wording showed for a fresh download:\n%s", fresh.View())
+	}
+
+	// With the working-directory fallback too, both notes are on screen.
+	both := downloadingModel(t, &fakes{})
+	both = send(both, tea.WindowSizeMsg{Width: 200, Height: 24})
+	both = send(both, downloadDoneMsg{seq: both.seq, res: &ytdlp.DownloadResult{
+		Path: "/work/Me at the zoo.mkv", UsedWorkingDir: true, AlreadyExisted: true,
+	}})
+	for _, want := range []string{"✓ Already there", "nothing was downloaded", "home directory could not be found", "so yank looked in the directory"} {
+		if !strings.Contains(both.View(), want) {
+			t.Errorf("the done screen with both notes is missing %q:\n%s", want, both.View())
+		}
+	}
+	// Nothing was written, so the fallback note must not say the file went there.
+	if strings.Contains(both.View(), "went to") {
+		t.Errorf("the done screen for a skipped download says the file went somewhere:\n%s", both.View())
+	}
+
+	// A fresh download into the fallback directory keeps the original note.
+	workDir := downloadingModel(t, &fakes{})
+	workDir = send(workDir, tea.WindowSizeMsg{Width: 200, Height: 24})
+	workDir = send(workDir, downloadDoneMsg{seq: workDir.seq, res: &ytdlp.DownloadResult{
+		Path: "/work/Me at the zoo.mkv", UsedWorkingDir: true,
+	}})
+	if !strings.Contains(workDir.View(), "so this went to the directory") {
+		t.Errorf("the fresh download into the working directory does not say where it went:\n%s", workDir.View())
+	}
+	if strings.Contains(workDir.View(), "yank looked in") {
+		t.Errorf("the already-there fallback note showed for a fresh download:\n%s", workDir.View())
+	}
+}
+
+// lineContaining is the index of the first rendered line containing sub, or -1.
+func lineContaining(view, sub string) int {
+	for i, line := range strings.Split(view, "\n") {
+		if strings.Contains(line, sub) {
+			return i
+		}
+	}
+	return -1
 }
 
 func TestInputScreenFramesTheBoxAndNamesTheApp(t *testing.T) {

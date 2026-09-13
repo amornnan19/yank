@@ -125,6 +125,13 @@ type DownloadResult struct {
 	// the home directory could not be resolved, so the UI can say where the
 	// file went instead of claiming it is in Downloads.
 	UsedWorkingDir bool
+	// AlreadyExisted records that yt-dlp wrote nothing because Path was already
+	// there, so the UI can say so instead of claiming a fresh download. It is
+	// yt-dlp's decision and keyed on the output filename, not on the format:
+	// a file from an earlier pick of a different format with the same name
+	// counts. It is true only when Path is the file yt-dlp reported as already
+	// downloaded; a run that downloaded or merged anything into Path is fresh.
+	AlreadyExisted bool
 	// Stderr is everything yt-dlp wrote to stderr, for the debug log.
 	Stderr string
 }
@@ -282,7 +289,7 @@ func runDownload(ctx context.Context, job downloadJob) (*DownloadResult, error) 
 		return nil, err
 	}
 
-	path := out.destination()
+	path, already := out.destination()
 	if path == "" {
 		return nil, ErrNoDestination
 	}
@@ -290,6 +297,7 @@ func runDownload(ctx context.Context, job downloadJob) (*DownloadResult, error) 
 		Path:           path,
 		OutputDir:      job.outDir,
 		UsedWorkingDir: job.fellBack,
+		AlreadyExisted: already,
 		Stderr:         stderr,
 	}, nil
 }
@@ -668,12 +676,17 @@ func (s *outputScanner) setPhase(phase Phase) {
 // both, the last Destination line is the download, and failing that the file
 // yt-dlp found already there.
 //
+// alreadyExisted is true only on that last branch. It is decided here, from the
+// same switch that picks the path, so the two cannot disagree: a run that
+// printed "has already been downloaded" for one stream and then merged has a
+// merged path, and that file is fresh.
+//
 // A run that both merges and extracts is not reachable from today's rows —
 // audioRow passes no -f, and yt-dlp's default for --extract-audio is a single
 // bestaudio stream that never merges — but it becomes reachable the moment a
 // row pairs a merging selector with -x, and ordering it correctly costs
 // nothing now.
-func (s *outputScanner) destination() string {
+func (s *outputScanner) destination() (path string, alreadyExisted bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.destinationLocked()
@@ -681,16 +694,16 @@ func (s *outputScanner) destination() string {
 
 // destinationLocked is destination without taking mu, for callers that already
 // hold it and must see the same answer this one gives.
-func (s *outputScanner) destinationLocked() string {
+func (s *outputScanner) destinationLocked() (path string, alreadyExisted bool) {
 	switch {
 	case s.audio != "":
-		return s.audio
+		return s.audio, false
 	case s.merged != "":
-		return s.merged
+		return s.merged, false
 	case len(s.dests) > 0:
-		return s.dests[len(s.dests)-1]
+		return s.dests[len(s.dests)-1], false
 	}
-	return s.already
+	return s.already, s.already != ""
 }
 
 // leftovers lists what a cancelled run should remove.
@@ -729,7 +742,7 @@ func (s *outputScanner) leftovers() []string {
 	defer s.mu.Unlock()
 
 	postProcessed := s.merged != "" || s.audio != ""
-	deliverable := s.destinationLocked()
+	deliverable, _ := s.destinationLocked()
 
 	paths := make([]string, 0, 3*len(s.dests))
 	for _, d := range s.dests {

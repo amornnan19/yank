@@ -551,6 +551,9 @@ func TestDownloadCapturesTheDestination(t *testing.T) {
 		name   string
 		stdout string
 		want   string
+		// already is AlreadyExisted: true only when the returned path is the
+		// one yt-dlp reported as already downloaded.
+		already bool
 	}{
 		{
 			name:   "a plain download",
@@ -575,9 +578,39 @@ func TestDownloadCapturesTheDestination(t *testing.T) {
 			want:   "/out/A Video: part 2 [HD].mkv",
 		},
 		{
-			name:   "nothing new to download",
-			stdout: "[download] /out/Video.mp4 has already been downloaded\n",
-			want:   "/out/Video.mp4",
+			name:    "nothing new to download",
+			stdout:  "[download] /out/Video.mp4 has already been downloaded\n",
+			want:    "/out/Video.mp4",
+			already: true,
+		},
+		{
+			name:    "a path with spaces that was already there survives",
+			stdout:  "[download] /out/A Video: part 2 [HD].mkv has already been downloaded\n",
+			want:    "/out/A Video: part 2 [HD].mkv",
+			already: true,
+		},
+		{
+			// One stream was on disk from an earlier run, the other was
+			// fetched, and the merge wrote a new file: that is a fresh result.
+			name: "a stream already there still merges into a fresh file",
+			stdout: "[download] /out/Video.f137.mp4 has already been downloaded\n" +
+				"[download] Destination: /out/Video.f251.webm\n" +
+				"1000/1000/NA/NA\n" +
+				`[Merger] Merging formats into "/out/Video.mp4"` + "\n",
+			want: "/out/Video.mp4",
+		},
+		{
+			name: "every stream already there still merges into a fresh file",
+			stdout: "[download] /out/Video.f137.mp4 has already been downloaded\n" +
+				"[download] /out/Video.f251.webm has already been downloaded\n" +
+				`[Merger] Merging formats into "/out/Video.mp4"` + "\n",
+			want: "/out/Video.mp4",
+		},
+		{
+			name: "a stream already there still extracts into a fresh file",
+			stdout: "[download] /out/Song.webm has already been downloaded\n" +
+				"[ExtractAudio] Destination: /out/Song.mp3\n",
+			want: "/out/Song.mp3",
 		},
 		{
 			// yt-dlp deletes the stream it extracted from, so returning the
@@ -609,6 +642,9 @@ func TestDownloadCapturesTheDestination(t *testing.T) {
 			}
 			if res.Path != tc.want {
 				t.Errorf("Path = %q, want %q", res.Path, tc.want)
+			}
+			if res.AlreadyExisted != tc.already {
+				t.Errorf("AlreadyExisted = %v, want %v", res.AlreadyExisted, tc.already)
 			}
 		})
 	}
@@ -1311,7 +1347,7 @@ func TestOutputScannerJoinsALineSplitAcrossWrites(t *testing.T) {
 			t.Fatalf("Write(%q) = %d, %v, want %d, nil", chunk, n, err, len(chunk))
 		}
 	}
-	if got := s.destination(); got != "/out/Video.mp4" {
+	if got, _ := s.destination(); got != "/out/Video.mp4" {
 		t.Errorf("destination() = %q, want %q", got, "/out/Video.mp4")
 	}
 }
@@ -1323,11 +1359,11 @@ func TestOutputScannerFlushesALineWithNoTrailingNewline(t *testing.T) {
 	if _, err := s.Write([]byte("[download] Destination: /out/Video.mp4")); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.destination(); got != "" {
+	if got, _ := s.destination(); got != "" {
 		t.Fatalf("destination() = %q before flush, want it still buffered", got)
 	}
 	s.flush()
-	if got := s.destination(); got != "/out/Video.mp4" {
+	if got, _ := s.destination(); got != "/out/Video.mp4" {
 		t.Errorf("destination() after flush = %q, want %q", got, "/out/Video.mp4")
 	}
 }
@@ -1355,7 +1391,7 @@ func TestOutputScannerDropsAnUnendingLine(t *testing.T) {
 	if _, err := s.Write([]byte("\n[download] Destination: /out/Video.mp4\n")); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.destination(); got != "/out/Video.mp4" {
+	if got, _ := s.destination(); got != "/out/Video.mp4" {
 		t.Errorf("destination() = %q, want %q", got, "/out/Video.mp4")
 	}
 }
