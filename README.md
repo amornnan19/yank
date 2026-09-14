@@ -28,7 +28,13 @@ go build -o yank ./cmd/yank
 
 Then put the `yank` binary somewhere on your `PATH`.
 
-The version string can be set at build time:
+`yank --version` reports the module version Go records in the binary, so
+`go install github.com/amornnan19/yank/cmd/yank@v1.2.3` prints `1.2.3`. A build
+from a clone reports the tag or pseudo-version of the checked-out commit, with
+`+dirty` when there are uncommitted changes. A build with no module version to
+record prints `dev`, followed by the commit it was built from when Go recorded
+one, e.g. `dev (51c041b1ae81, modified)`. The
+version string can also be set at build time, which wins over both:
 
 ```
 go build -ldflags "-X main.Version=1.2.3" ./cmd/yank

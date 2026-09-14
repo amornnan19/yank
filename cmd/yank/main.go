@@ -26,11 +26,6 @@ import (
 	"github.com/amornnan19/yank/internal/ytdlp"
 )
 
-// Version is the current yank version. Set at build time with:
-//
-//	go build -ldflags "-X main.Version=1.2.3" ./cmd/yank
-var Version = "0.1.0"
-
 // Exit codes are part of the interface, not an afterthought: the scriptable
 // flags in the backlog are specified against them. A quit the user asked for
 // scores 0 — pressing q, and equally a signal that shut the program down — and
@@ -143,7 +138,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if *version {
-		fmt.Fprintln(stdout, Version)
+		fmt.Fprintln(stdout, currentVersion())
 		return exitOK
 	}
 

@@ -1,6 +1,6 @@
 BIN := yank
 
-# VERSION overrides main.Version; left empty, the default in cmd/yank/main.go stands.
+# VERSION overrides main.Version; left empty, yank takes it from Go's build info.
 VERSION ?=
 LDFLAGS := $(if $(VERSION),-X main.Version=$(VERSION))
 
