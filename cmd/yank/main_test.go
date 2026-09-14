@@ -111,8 +111,8 @@ func TestVersionPrintsTheVersionAndExitsZero(t *testing.T) {
 	if code != exitOK {
 		t.Fatalf("--version exited %d, want %d", code, exitOK)
 	}
-	if stdout != Version+"\n" {
-		t.Fatalf("--version printed %q, want %q", stdout, Version+"\n")
+	if want := currentVersion() + "\n"; stdout != want {
+		t.Fatalf("--version printed %q, want %q", stdout, want)
 	}
 	if stderr != "" {
 		t.Fatalf("--version wrote to stderr: %q", stderr)
@@ -125,11 +125,23 @@ func TestVersionPrintsTheVersionAndExitsZero(t *testing.T) {
 // Version has to stay a plain package-scope string for -ldflags -X to reach it.
 // A test cannot observe the linker, but it can observe the two things that
 // would break it: a different type, and a name that is not addressable from
-// outside the file.
+// outside the file. Assigning to it here is what -X does at link time, and
+// --version has to print that value. Unstamped, as a test binary is, what it
+// prints must still be something.
 func TestVersionIsANonEmptyString(t *testing.T) {
-	var v string = Version
-	if v == "" {
-		t.Fatal("Version is empty")
+	harness(t, true, nil)
+	old := Version
+	t.Cleanup(func() { Version = old })
+
+	Version = ""
+	if code, stdout, _ := exec(t, "--version"); code != exitOK || strings.TrimSpace(stdout) == "" {
+		t.Fatalf("an unstamped --version exited %d with stdout %q", code, stdout)
+	}
+
+	var v string = "9.9.9"
+	Version = v
+	if code, stdout, _ := exec(t, "--version"); code != exitOK || stdout != v+"\n" {
+		t.Fatalf("a stamped --version exited %d with stdout %q, want %q", code, stdout, v+"\n")
 	}
 }
 
@@ -213,7 +225,7 @@ func TestHelpAndVersionWorkWithoutATerminal(t *testing.T) {
 	if code, stdout, _ := exec(t, "--help"); code != exitOK || !strings.Contains(stdout, "Usage:") {
 		t.Errorf("--help through a pipe exited %d with stdout %q", code, stdout)
 	}
-	if code, stdout, _ := exec(t, "--version"); code != exitOK || stdout != Version+"\n" {
+	if code, stdout, _ := exec(t, "--version"); code != exitOK || (stdout != currentVersion()+"\n" || stdout == "\n") {
 		t.Errorf("--version through a pipe exited %d with stdout %q", code, stdout)
 	}
 }
