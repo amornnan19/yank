@@ -4,7 +4,10 @@ BIN := yank
 VERSION ?=
 LDFLAGS := $(if $(VERSION),-X main.Version=$(VERSION))
 
-.PHONY: all build install run test race vet fmt fmt-check check clean help
+# The exact GoReleaser the release workflow runs, run through go so nothing needs installing.
+GORELEASER := go run github.com/goreleaser/goreleaser/v2@v2.18.1
+
+.PHONY: all build install run test race vet fmt fmt-check check snapshot clean help
 
 all: check build
 
@@ -34,8 +37,11 @@ fmt-check: ## Fail if any file needs gofmt
 
 check: fmt-check vet test ## gofmt, vet and tests, as the release checklist runs them
 
-clean: ## Remove the built binary
-	rm -f $(BIN)
+snapshot: ## Build the release archives, checksums and formula into dist/ without publishing
+	$(GORELEASER) release --snapshot --clean --skip=publish
+
+clean: ## Remove the built binary and dist/
+	rm -rf $(BIN) dist
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'

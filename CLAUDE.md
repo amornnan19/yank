@@ -142,6 +142,20 @@ needs the same ioctl Bubble Tea already uses for it: the rule is about what ship
 in the binary, and hand-rolling a per-GOOS ioctl to avoid *declaring* a package
 we already ship would add untestable platform code to keep a list short.
 
+**Release tags.** An rc tag and its final tag may point at the same commit, and
+GoReleaser picks the current tag with `git tag --points-at HEAD
+--sort=-version:refname`, which sorts `v0.1.1-rc.1` above `v0.1.1`. Without a
+fix, pushing the final tag rebuilds the rc, the upload to the rc's release
+fails, and the tap is never updated. Keep both `git.prerelease_suffix: "-"` in
+`.goreleaser.yaml` and `GORELEASER_CURRENT_TAG: ${{ github.ref_name }}` in
+`release.yml`; either alone fixes it, and removing one is not a cleanup. A tag
+with a `-` is a pre-release: it never touches `amornnan19/homebrew-tap` and
+needs no `HOMEBREW_TAP_TOKEN`. A final tag fails before publishing when that
+secret is empty. The version is stamped from `{{ .Version }}`, which has no
+`v`, because a `-X` value is printed verbatim. The formula is named `yank` on
+purpose, although homebrew-core has an unrelated `yank` (mptre/yank): install
+instructions always spell out `amornnan19/tap/yank`.
+
 ## Verification
 
 A check that was not run is not a check that passed. Paste real command output

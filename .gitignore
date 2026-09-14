@@ -5,3 +5,5 @@
 # Agent scratch, not project source
 .claude/agent-memory/
 .claude/worktrees/
+
+dist/
