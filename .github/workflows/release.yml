@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # The same checks as go.yml, run on the tagged commit itself: a tag can point
+  # at a commit go.yml never saw, so nothing is released on its word alone.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: make fmt-check
+
+      - name: Vet
+        run: make vet
+
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Race
+        run: make race
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      # Create the GitHub release and upload its assets.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # GoReleaser needs the full history and tags for the changelog and to
+          # find the previous tag.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # A final release updates the Homebrew tap. Fail here, before anything is
+      # published, rather than after the GitHub release is already out. A
+      # pre-release tag (with a "-") never touches the tap and needs no token.
+      - name: Require the tap token for a final release
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is not set; a final release must update amornnan19/homebrew-tap."
+            exit 1
+          fi
+
+      - name: GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          # Exact version, the same one .goreleaser.yaml and the Makefile name.
+          version: v2.18.1
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The tag that triggered this run. Without it GoReleaser picks among
+          # all tags on HEAD, and an rc on the same commit could win.
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
+          # Fine-grained token with contents write on amornnan19/homebrew-tap.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

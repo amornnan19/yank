@@ -11,6 +11,44 @@ the downloading, and yank is the interface in front of it.
 
 ## Install
 
+yank is a single static binary. It needs neither Go nor yt-dlp at runtime: it
+fetches and updates its own yt-dlp (see [How it works](#how-it-works)).
+
+### Homebrew (macOS and Linux)
+
+```
+brew install amornnan19/tap/yank
+```
+
+ffmpeg is optional and not installed with yank; `brew install ffmpeg` adds the
+merged and mp3 rows to the format picker.
+
+### Download a binary
+
+Each [release](https://github.com/amornnan19/yank/releases) carries a
+`yank_<version>_<os>_<arch>.tar.gz` for `darwin` and `linux` on `amd64` and
+`arm64`, and a `checksums.txt` with their SHA-256:
+
+```
+shasum -a 256 -c checksums.txt --ignore-missing
+tar -xzf yank_<version>_<os>_<arch>.tar.gz yank
+./yank --version
+```
+
+Then put the `yank` binary somewhere on your `PATH`.
+
+**macOS Gatekeeper.** The binaries are not signed or notarized, so macOS
+quarantines one downloaded by a browser and refuses to run it. Clear the flag
+once:
+
+```
+xattr -d com.apple.quarantine ./yank
+```
+
+Homebrew installs are not affected.
+
+### With Go
+
 Go 1.27.1 or newer is required (the version in `go.mod`):
 
 ```

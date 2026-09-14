@@ -1,0 +1,109 @@
+# GoReleaser configuration for yank. Run by .github/workflows/release.yml on a
+# pushed v* tag; `make snapshot` builds the same artifacts locally into dist/.
+#
+# Pinned to GoReleaser v2.18.1: the workflow and the Makefile name that exact
+# version, so a release never picks up a new GoReleaser by accident.
+version: 2
+
+project_name: yank
+
+git:
+  # v0.1.1 tagged on the same commit as v0.1.1-rc.1: plain version:refname
+  # sorts the -rc above the final, so the final run would pick the rc as the
+  # current tag. Sorting "-" suffixes as pre-releases puts v0.1.1 first.
+  prerelease_suffix: "-"
+
+builds:
+  - id: yank
+    main: ./cmd/yank
+    binary: yank
+    env:
+      # One static binary: yank needs neither Go nor a C library at runtime.
+      - CGO_ENABLED=0
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      # .Version is the tag without its leading v. A value stamped with -X is
+      # printed verbatim (#29), so this is exactly what yank --version shows.
+      - -s -w -X main.Version={{ .Version }}
+
+archives:
+  - id: yank
+    ids: [yank]
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+release:
+  github:
+    owner: amornnan19
+    name: yank
+  # A tag such as v0.1.1-rc.1 is published as a pre-release.
+  prerelease: auto
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs(\\(.*\\))?:"
+      - "^test(\\(.*\\))?:"
+      - "^style(\\(.*\\))?:"
+      - "^chore(\\(.*\\))?:"
+  groups:
+    - title: Features
+      regexp: '^feat(\(.+\))?!?:'
+      order: 0
+    - title: Bug fixes
+      regexp: '^fix(\(.+\))?!?:'
+      order: 1
+    - title: Performance
+      regexp: '^perf(\(.+\))?!?:'
+      order: 2
+    - title: Other changes
+      order: 999
+
+# brews is deprecated in GoReleaser v2 in favour of homebrew_casks, and is used
+# here anyway: a cask installs on macOS only, and yank's tap has to install on
+# Linux as well. v2.18.1 still generates formulas from this section; it prints a
+# deprecation notice on every run.
+brews:
+  - name: yank
+    ids: [yank]
+    repository:
+      owner: amornnan19
+      name: homebrew-tap
+      branch: main
+      # A fine-grained token with contents write access to the tap only. The
+      # release itself uses the workflow's GITHUB_TOKEN.
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    commit_author:
+      name: amornnan19
+      email: amornnan19@users.noreply.github.com
+    commit_msg_template: "yank {{ .Tag }}"
+    homepage: https://yank.ghostshift.tech/
+    description: Terminal UI for downloading video with yt-dlp
+    license: MIT
+    # auto: a pre-release tag (v0.1.1-rc.1) never updates the tap.
+    skip_upload: auto
+    # yank fetches and updates its own yt-dlp and is a static binary, so
+    # neither yt-dlp nor go is a dependency. ffmpeg only adds rows to the picker.
+    dependencies:
+      - name: ffmpeg
+        type: optional
+    install: |
+      bin.install "yank"
+    caveats: |
+      yank downloads its own checksum-verified yt-dlp on first run.
+      ffmpeg is optional: install it (brew install ffmpeg) to get merged
+      video+audio and mp3 rows in the format picker.
+    test: |
+      assert_match version.to_s, shell_output("#{bin}/yank --version")
