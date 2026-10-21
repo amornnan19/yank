@@ -1454,6 +1454,155 @@ func TestZipappRunnableClassifiesACutShortToolsCheck(t *testing.T) {
 	}
 }
 
+func TestZipappRunnableRequiresARecentPython(t *testing.T) {
+	// The record this guards is the one commit fafea27 left behind (#27): a
+	// zipapp installed before the 3.10 rule existed, beside a python3 too old
+	// to run it. Trusting that record hands the user yt-dlp's own "Only Python
+	// versions 3.10 and above are supported" ImportError at download time with
+	// nothing to repair it, so an interpreter answering with an old version is
+	// positive evidence this host cannot run the zipapp: (false, nil), the
+	// caller's licence to discard it. The darwin path is the one exercised
+	// because that is where the stub lives — python3 resolves into systemDir,
+	// so xcode-select -p is consulted and exits 0 here, which is the machine
+	// the bug was found on: the tools are installed and the stub is 3.9.6.
+	// Output that carries no version at all is the third outcome, not a
+	// quiet false: the run succeeded, so what it printed may well prove the
+	// host can run the zipapp, and deleting the file because we could not read
+	// it is the branch the cached artifacts rule forbids.
+	tests := []struct {
+		name string
+		body string
+		want bool
+		// wantErr is the inconclusive answer: nothing was learned, so the
+		// caller must keep every file.
+		wantErr bool
+	}{
+		{name: "3.9 is the Command Line Tools stub", body: "echo 'Python 3.9.6'\n"},
+		{name: "3.8 is older still", body: "echo 'Python 3.8.10'\n"},
+		{name: "3.10 is the floor", body: "echo 'Python 3.10.0'\n", want: true},
+		{name: "3.12", body: "echo 'Python 3.12.1'\n", want: true},
+		{name: "3.9 on stderr, as old pythons print it", body: "echo 'Python 3.9.6' >&2\n"},
+		{name: "3.12 on stderr", body: "echo 'Python 3.12.1' >&2\n", want: true},
+		// Both streams are merged, so anything written before the version line
+		// is in the buffer with it: a linker warning, a mise/conda activation
+		// notice, a wrapper script's own warning. The version behind it still
+		// decides, both ways. Reading the buffer as one string would make the
+		// first of these strand a zipapp this python3 runs perfectly well.
+		{name: "noise ahead of a recent version", body: "echo 'ld: warning: ignoring file libfoo.dylib' >&2\necho 'Python 3.12.1'\n", want: true},
+		{name: "noise ahead of an old version", body: "echo 'warning: setlocale failed' >&2\necho 'Python 3.9.6'\n"},
+		{name: "a trailing note after the version", body: "echo 'Python 3.12.1'\necho 'note: pyenv shim' >&2\n", want: true},
+		{name: "ran and refused", body: "echo 'Python 3.12.1'\nexit 1\n"},
+		{name: "ran and said nothing", body: "exit 0\n"},
+		{name: "not python at all", body: "echo 'Perl 5'\n", wantErr: true},
+		{name: "a version with no minor to read", body: "echo 'Python 3.x'\n", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env, dir, pyLog := pythonHost(t, "darwin", tt.body)
+			env.systemDir = dir
+			xcodeLog := fakeTool(t, dir, "xcode-select", "echo /Library/Developer/CommandLineTools\nexit 0\n")
+
+			runnable, err := zipappRunnable(t.Context(), env)
+			switch {
+			case tt.wantErr && err == nil:
+				t.Fatalf("zipappRunnable() = %t, <nil>; want an error: the version was not read, so nothing was learned", runnable)
+			case !tt.wantErr && err != nil:
+				t.Fatalf("zipappRunnable() error = %v, want a positive answer either way", err)
+			}
+			if runnable != tt.want {
+				t.Errorf("zipappRunnable() = %t, want %t", runnable, tt.want)
+			}
+			if n := runsLogged(t, xcodeLog); n != 1 {
+				t.Errorf("xcode-select ran %d times, want 1", n)
+			}
+			if n := runsLogged(t, pyLog); n != 1 {
+				t.Errorf("python3 ran %d times, want 1", n)
+			}
+		})
+	}
+}
+
+func TestZipappRunnableClassifiesACutShortVersionRead(t *testing.T) {
+	// The version read is the second thing that can be cut short, and it must
+	// land on the error branch and never on false: false here is the caller's
+	// licence to remove a checksum-verified cached file, and a cancel or our
+	// own timeout is no evidence about the python3 on this host. The errors are
+	// the ones os/exec really produces — a real script that never answers,
+	// killed by a real context — because Run under exec.CommandContext reports
+	// a context that fired mid-run as an *exec.ExitError saying "signal:
+	// killed", and only the wrapping inside classifyProbe says otherwise.
+	tests := []struct {
+		name string
+		// arrange may adjust env and returns the context to use. It gets the
+		// fake python3's run log so a cancel can wait for the run to start.
+		arrange func(t *testing.T, env *pythonEnv, pyLog string) context.Context
+		check   func(t *testing.T, err error)
+	}{
+		{"cancelled during the read", func(t *testing.T, _ *pythonEnv, pyLog string) context.Context {
+			ctx, cancel := context.WithCancel(t.Context())
+			go func() {
+				for t.Context().Err() == nil {
+					if _, err := os.Stat(pyLog); err == nil {
+						cancel()
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}()
+			return ctx
+		}, func(t *testing.T, err error) {
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("error = %v, want it to wrap context.Canceled", err)
+			}
+			if !IsCancelled(err) {
+				t.Errorf("IsCancelled(%v) = false, want true", err)
+			}
+		}},
+		{"timed out", func(t *testing.T, env *pythonEnv, _ string) context.Context {
+			env.timeout = 2 * time.Second
+			return t.Context()
+		}, func(t *testing.T, err error) {
+			if !strings.Contains(err.Error(), "--version timed out after 2s") {
+				t.Errorf("error = %q, want it to say the version read timed out", err)
+			}
+			if IsCancelled(err) {
+				t.Errorf("IsCancelled(%v) = true, want false: our own timeout is not the caller's cancellation", err)
+			}
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// linux, so the tools check is skipped and the version read is the
+			// only thing running. sleep is spelled with its path because the
+			// fake runs with whatever PATH the test has, and a "sleep: not
+			// found" exit 127 would be a positive failure, not a hang. Five
+			// seconds is long enough for the 2s timeout below to fire well
+			// inside it, even allowing macOS a few hundred milliseconds for
+			// the first exec of a freshly written script, and short enough
+			// that the orphan the kill leaves behind is gone soon after.
+			env, _, pyLog := pythonHost(t, "linux", "/bin/sleep 5\n")
+			ctx := tt.arrange(t, &env, pyLog)
+
+			runnable, err := zipappRunnable(ctx, env)
+			if err == nil {
+				t.Fatalf("zipappRunnable() = %t, <nil>, want an error: nothing was learned", runnable)
+			}
+			if runnable {
+				t.Errorf("zipappRunnable() = true alongside %v, want false", err)
+			}
+			if isBadBinary(err) {
+				t.Errorf("isBadBinary(%v) = true, want false: an unanswered version read is not a verdict", err)
+			}
+			tt.check(t, err)
+			if n := runsLogged(t, pyLog); n != 1 {
+				t.Errorf("python3 ran %d times, want 1", n)
+			}
+		})
+	}
+}
+
 func TestPythonIsRecent(t *testing.T) {
 	tests := []struct {
 		version string
@@ -1909,6 +2058,51 @@ func TestResolveDiscardsATrustedZipappTheHostCanNoLongerRun(t *testing.T) {
 	}
 }
 
+func TestResolveDiscardsATrustedZipappWhosePythonIsTooOld(t *testing.T) {
+	// The cache this machine actually had (#27): a zipapp installed before
+	// commit fafea27 added the 3.10 rule, a record that still matches it
+	// exactly, and /usr/bin/python3 at 3.9.6 with the Command Line Tools
+	// installed, so xcode-select -p exits 0. Nothing distrusted the record and
+	// nothing probed, so Resolve returned the zipapp and yt-dlp died at
+	// download time with its own ImportError. Now the version rules the host
+	// out, the zipapp is discarded without ever being executed, and the bundle
+	// takes its place.
+	binary, runLog := cachedFake(t, "2026.09.01")
+	sidecar := currentRecord(t, binary, "2026.08.19")
+	sidecar.Asset = zipappAsset
+	writeSidecar(t, binary, sidecar)
+	env, dir, pyLog := pythonHost(t, runtime.GOOS, "echo 'Python 3.9.6'\n")
+	env.systemDir = dir
+	fakeTool(t, dir, "xcode-select", "echo /Library/Developer/CommandLineTools\nexit 0\n")
+	base, requested := fakeRelease(t, "echo 2026.09.01\n", "echo 2026.08.19\n")
+	bundle := assetName(runtime.GOOS, runtime.GOARCH)
+
+	events := make(chan ResolveEvent, 2)
+	res, err := resolveWith(t.Context(), events, time.Minute, 300*time.Millisecond, base, env)
+	if err != nil {
+		t.Fatalf("resolveWith() error = %v, want the zipapp replaced by the bundle", err)
+	}
+	if res.Path != binary || res.Source != SourceDownload || res.Version != "2026.08.19" {
+		t.Errorf("result = %+v, want the bundle's answer from SourceDownload", res)
+	}
+	if n := runsLogged(t, runLog); n != 0 {
+		t.Errorf("the cached zipapp ran %d times, want 0: this python3 cannot run it", n)
+	}
+	if got := strings.Join(requested(), ","); got != bundle {
+		t.Errorf("assets requested = %q, want only %q: the zipapp must not be fetched again", got, bundle)
+	}
+	if rec := readSidecar(t, binary); rec.Asset != bundle || rec.Version != "2026.08.19" {
+		t.Errorf("sidecar = %+v, want the bundle recorded", rec)
+	}
+	// Twice: once for the record check, once for the asset choice chooseAsset
+	// makes afresh for the repair, which lands on the bundle for the same
+	// reason.
+	if n := runsLogged(t, pyLog); n != 2 {
+		t.Errorf("python3 ran %d times, want 2", n)
+	}
+	downloadedOnce(t, events)
+}
+
 func TestResolveDoesNotConsultPythonForABundleRecord(t *testing.T) {
 	// The no-exec check is for the zipapp alone. A record naming the bundle
 	// is trusted as before, with no lookup and no xcode-select.
@@ -1944,8 +2138,8 @@ func TestResolveDoesNotConsultPythonForABundleRecord(t *testing.T) {
 }
 
 func TestResolveTrustsAZipappRecordWhenTheHostCanRunIt(t *testing.T) {
-	// The check that lets a zipapp record be trusted executes neither the
-	// zipapp nor python3: lookup only, plus xcode-select on darwin for the
+	// The check that lets a zipapp record be trusted never executes the
+	// zipapp: a lookup, python3 --version, and xcode-select on darwin for the
 	// system python, which this fake is not, so a failing xcode-select must
 	// not be consulted and cannot rule the record out.
 	binary, runLog := cachedFake(t, "2026.09.01")
@@ -1966,8 +2160,8 @@ func TestResolveTrustsAZipappRecordWhenTheHostCanRunIt(t *testing.T) {
 	if n := runsLogged(t, runLog); n != 0 {
 		t.Errorf("the cached zipapp ran %d times, want 0", n)
 	}
-	if n := runsLogged(t, pyLog); n != 0 {
-		t.Errorf("python3 ran %d times, want 0: the record is trusted on a lookup alone", n)
+	if n := runsLogged(t, pyLog); n != 1 {
+		t.Errorf("python3 ran %d times, want 1: the record is trusted only once the version is known", n)
 	}
 	if n := runsLogged(t, xcodeLog); n != 0 {
 		t.Errorf("xcode-select ran %d times, want 0: this python3 is not the system stub", n)

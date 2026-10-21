@@ -186,9 +186,10 @@ func resolveWith(ctx context.Context, events chan<- ResolveEvent, timeout, delay
 		rec = readRecord(cached)
 	}
 	// A record that names the zipapp is checked before it is trusted and
-	// before the file is probed, and executing nothing but xcode-select -p
-	// (#19). Both trusting and probing end in an exec of the zipapp, and on
-	// darwin an exec of `env python3` with the Command Line Tools gone (a
+	// before the file is probed, executing nothing but xcode-select -p and
+	// python3 --version (#19, #27), never the zipapp itself. Both trusting and
+	// probing end in an exec of the zipapp, and on darwin an exec of
+	// `env python3` with the Command Line Tools gone (a
 	// macOS major upgrade removes them) does not fail: /usr/bin/python3 is
 	// always present as a stub that opens the install dialog instead. The
 	// record's asset is read even when its size and mtime no longer match,
@@ -251,14 +252,24 @@ func resolveWith(ctx context.Context, events chan<- ResolveEvent, timeout, delay
 		// says why two first runs racing are safe.
 	case stranded:
 		// A discard without a probe, and the only one. The zipapp is an
-		// optimisation over the bundle, never a requirement, and a host that
-		// cannot run python3 without a dialog positively cannot run the
-		// zipapp; no exec was needed to know that, and none was made. The
-		// asset choice below is made afresh and will pick the bundle, which
-		// is the repair. The cost is accepted: a launch whose PATH happens
-		// not to have python3 (a GUI launcher, cron) downgrades a good zipapp
-		// to the bundle permanently, because the bundle's record is trusted
-		// on every run after that.
+		// optimisation over the bundle, never a requirement, and the grounds
+		// for stranding it are all positive: python3 is absent from PATH or
+		// the Command Line Tools are gone, so no interpreter can be run here;
+		// a version we did parse is older than yt-dlp's own minimum; or the
+		// interpreter ran and refused, which classifyProbe marked as the
+		// file's own fault. The zipapp itself was never executed to find any
+		// of that out. Output we could not parse is deliberately not among
+		// them: the run succeeded, so the output may well prove this host
+		// runs the zipapp, and deleting the file over our own failure to read
+		// it would discard a checksum-verified artifact without evidence of
+		// the failure it is blamed for. zipappRunnable reports that as an
+		// error instead, and the run above stopped with the file kept.
+		//
+		// The asset choice below is made afresh and will pick the bundle,
+		// which is the repair. The cost is accepted: a launch whose PATH
+		// happens not to have python3 (a GUI launcher, cron) downgrades a good
+		// zipapp to the bundle permanently, because the bundle's record is
+		// trusted on every run after that.
 		repair = true
 	case isBadBinary(probeErr):
 		// The file itself is at fault. That includes a zipapp whose python3
@@ -618,17 +629,94 @@ func usablePython(ctx context.Context, env pythonEnv) bool {
 }
 
 // zipappRunnable reports whether a cached zipapp may be executed on this host
-// at all, without executing it: python3 is on PATH, and on darwin, when it is
-// the Command Line Tools stub, the tools are installed, so `env python3` runs
-// an interpreter rather than opening a dialog. It is usablePython without the
-// version check, because the record says the zipapp already ran here once and
-// the probe that follows a distrusted record will say if that has changed.
-// err reports that the question could not be answered this run (xcode-select
-// was cancelled, timed out or would not start); the caller must then neither
-// trust the record nor remove the file.
+// at all, without executing it: python3 is on PATH; on darwin, when it is the
+// Command Line Tools stub, the tools are installed, so `env python3` runs an
+// interpreter rather than opening a dialog; and that interpreter is at least
+// minPythonMinor.
+//
+// The version is asked for even though a record exists, because "the zipapp ran
+// here once" is not evidence that it runs here now. The record may have been
+// written by a yank that predates the 3.10 rule (#27), or by a run whose PATH
+// led to a different python3 than this one's does, and a zipapp record beside a
+// 3.9 interpreter is exactly the cache those leave behind: the record is
+// trusted, nothing is probed, and the user gets yt-dlp's own "Only Python
+// versions 3.10 and above are supported" ImportError at download time with
+// nothing to repair it. Reading the version costs one interpreter start (~0.01s,
+// measured in #19), far less than the download and failed probe that accepting
+// an old python leads to.
+//
+// usablePython collapses every failure to false on purpose: false there only
+// means "download the bundle instead", which is always safe. false here
+// *removes a cached, checksum-verified file*, so the three outcomes stay apart:
+//
+//   - (true, nil): the host can run it; the record may be trusted or the file
+//     probed.
+//   - (false, nil): positive evidence it cannot — no python3 on PATH, the
+//     Command Line Tools are gone, a version we parsed that is older than
+//     minPythonMinor, or a run classifyProbe marked positive.
+//   - (_, err): the question could not be answered this run (a cancellation,
+//     our own timeout, a signal we did not send, pipes cut before any output,
+//     an interpreter that would not start, or output with no version line in
+//     it). The caller must then neither trust the record nor remove the file.
 func zipappRunnable(ctx context.Context, env pythonEnv) (bool, error) {
-	_, ok, err := pythonOnPath(ctx, env)
-	return ok, err
+	path, ok, err := pythonOnPath(ctx, env)
+	if err != nil || !ok {
+		return false, err
+	}
+	// Older pythons print their version to stderr, so both streams are read,
+	// as usablePython does.
+	out, err := versionOutput(ctx, path, env.timeout, env.delay, true)
+	if err != nil {
+		// classifyProbe has already sorted the two apart, so no second
+		// classifier is needed here. A python3 that started and refused — a
+		// non-zero exit, an exit 0 with nothing to say, an image the kernel
+		// rejected — is as positive about this host as no python3 at all. That
+		// knowingly includes a pyenv/asdf/mise shim refusing for a reason local
+		// to the working directory (an uninstalled .python-version): the
+		// process ran and refused, the same evidence the zipapp's own `env`
+		// exit 127 is already treated as positive, and the bundle still works.
+		// Everything else is inconclusive and keeps the file.
+		if isBadBinary(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	line, ok := pythonVersionLine(out)
+	if !ok {
+		// It ran, it exited 0, and nothing it printed is a version. That is
+		// not evidence against the host; it is us failing to read the answer.
+		// Stranding here would remove a checksum-verified zipapp on the
+		// strength of output that may well prove the host can run it, which is
+		// the branch the cached artifacts rule forbids, so the caller keeps
+		// every file and stops this run instead.
+		return false, fmt.Errorf("%s --version printed no version: %q", path, out)
+	}
+	return pythonIsRecent(line), nil
+}
+
+// pythonVersionLine picks the line of a python --version run that carries the
+// version out of the merged output, and reports whether there was one.
+//
+// It exists because zipappRunnable needs both streams — older pythons print the
+// version to stderr — and anything else written there lands in the same buffer:
+// a dyld or linker warning, a mise/conda activation notice, a wrapper script's
+// own warning. pythonIsRecent matches a whole string, so a version sitting
+// behind one of those would read as no version at all, and zipappRunnable
+// would delete the zipapp over it. usablePython needs none of this: its false
+// only picks the cheaper asset.
+//
+// A line is the answer only when a digit follows "Python 3.". "Python 3.x" is
+// as unreadable as a line of warning text, and treating it as a version would
+// turn "we could not parse this" into the positive "this host is too old".
+func pythonVersionLine(out string) (string, bool) {
+	for _, line := range strings.Split(out, "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "Python 3.")
+		if !ok || rest == "" || rest[0] < '0' || rest[0] > '9' {
+			continue
+		}
+		return line, true
+	}
+	return "", false
 }
 
 // pythonOnPath finds python3 and, on darwin when it resolves into
